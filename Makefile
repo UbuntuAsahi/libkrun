@@ -224,6 +224,7 @@ endif
 	mv target/release/libkrun.dylib target/release/$(KRUN_BASE_$(OS))
 endif
 	cp target/release/$(KRUN_BASE_$(OS)) $(LIBRARY_RELEASE_$(OS))
+endif
 
 $(LIBRARY_DEBUG_$(OS)): $(SYSROOT_TARGET) $(INIT_BINARY_BSD)
 	cargo build $(FEATURE_FLAGS)
@@ -234,6 +235,7 @@ ifeq ($(TDX),1)
 	mv target/debug/libkrun.so target/debug/$(KRUN_BASE_$(OS))
 endif
 	cp target/debug/$(KRUN_BASE_$(OS)) $(LIBRARY_DEBUG_$(OS))
+endif
 
 libkrun.pc: libkrun.pc.in Makefile
 	rm -f $@ $@-t
@@ -245,7 +247,7 @@ libkrun.pc: libkrun.pc.in Makefile
 	    libkrun.pc.in > $@-t
 	mv $@-t $@
 
-install: libkrun.pc
+install:
 	install -d $(DESTDIR)$(PREFIX)/$(LIBDIR_$(OS))/
 	install -d $(DESTDIR)$(PREFIX)/$(LIBDIR_$(OS))/pkgconfig
 	install -d $(DESTDIR)$(PREFIX)/include
