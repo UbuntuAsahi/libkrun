@@ -234,10 +234,7 @@ impl ClangSubItemParser for Var {
                                 assert_eq!(c.len_utf8(), 1);
                                 c as u8
                             }
-                            CChar::Raw(c) => {
-                                assert!(c <= u64::from(u8::MAX));
-                                c as u8
-                            }
+                            CChar::Raw(c) => u8::try_from(c).unwrap(),
                         };
 
                         (TypeKind::Int(IntKind::U8), VarType::Char(c))
@@ -430,7 +427,11 @@ fn parse_macro(
 ) -> Option<(Vec<u8>, cexpr::expr::EvalResult)> {
     use cexpr::expr;
 
-    let cexpr_tokens = cursor.cexpr_tokens();
+    let mut cexpr_tokens = cursor.cexpr_tokens();
+
+    for callbacks in &ctx.options().parse_callbacks {
+        callbacks.modify_macro(&cursor.spelling(), &mut cexpr_tokens);
+    }
 
     let parser = expr::IdentifierParser::new(ctx.parsed_macros());
 

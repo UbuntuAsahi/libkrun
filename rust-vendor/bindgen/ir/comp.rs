@@ -56,16 +56,16 @@ pub(crate) enum MethodKind {
 
 impl MethodKind {
     /// Is this a destructor method?
-    pub(crate) fn is_destructor(&self) -> bool {
+    pub(crate) fn is_destructor(self) -> bool {
         matches!(
-            *self,
+            self,
             MethodKind::Destructor | MethodKind::VirtualDestructor { .. }
         )
     }
 
     /// Is this a pure virtual method?
-    pub(crate) fn is_pure_virtual(&self) -> bool {
-        match *self {
+    pub(crate) fn is_pure_virtual(self) -> bool {
+        match self {
             MethodKind::Virtual { pure_virtual } |
             MethodKind::VirtualDestructor { pure_virtual } => pure_virtual,
             _ => false,
@@ -1855,7 +1855,7 @@ impl IsOpaque for CompInfo {
             // See https://github.com/rust-lang/rust-bindgen/issues/537 and
             // https://github.com/rust-lang/rust/issues/33158
             if self.is_packed(ctx, layout.as_ref()) &&
-                layout.map_or(false, |l| l.align > 1)
+                layout.is_some_and(|l| l.align > 1)
             {
                 warn!("Found a type that is both packed and aligned to greater than \
                        1; Rust before version 1.33 doesn't have `#[repr(packed(N))]`, so we \

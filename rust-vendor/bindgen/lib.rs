@@ -86,10 +86,12 @@ pub const DEFAULT_ANON_FIELDS_PREFIX: &str = "__bindgen_anon_";
 const DEFAULT_NON_EXTERN_FNS_SUFFIX: &str = "__extern";
 
 fn file_is_cpp(name_file: &str) -> bool {
-    name_file.ends_with(".hpp") ||
-        name_file.ends_with(".hxx") ||
-        name_file.ends_with(".hh") ||
-        name_file.ends_with(".h++")
+    Path::new(name_file).extension().is_some_and(|ext| {
+        ext.eq_ignore_ascii_case("hpp") ||
+            ext.eq_ignore_ascii_case("hxx") ||
+            ext.eq_ignore_ascii_case("hh") ||
+            ext.eq_ignore_ascii_case("h++")
+    })
 }
 
 fn args_are_cpp(clang_args: &[Box<str>]) -> bool {
@@ -206,7 +208,7 @@ impl std::fmt::Display for Formatter {
             Self::Prettyplease => "prettyplease",
         };
 
-        s.fmt(f)
+        std::fmt::Display::fmt(&s, f)
     }
 }
 
@@ -346,6 +348,18 @@ impl Builder {
         }
 
         // Transform input headers to arguments on the clang command line.
+        self.options.fallback_clang_args = self
+            .options
+            .clang_args
+            .iter()
+            .filter(|arg| {
+                !arg.starts_with("-MMD") &&
+                    !arg.starts_with("-MD") &&
+                    !arg.starts_with("--write-user-dependencies") &&
+                    !arg.starts_with("--user-dependencies")
+            })
+            .cloned()
+            .collect::<Vec<_>>();
         self.options.clang_args.extend(
             self.options.input_headers
                 [..self.options.input_headers.len().saturating_sub(1)]
@@ -361,7 +375,7 @@ impl Builder {
                 })
                 .collect::<Vec<_>>();
 
-        Bindings::generate(self.options, input_unsaved_files)
+        Bindings::generate(self.options, &input_unsaved_files)
     }
 
     /// Preprocess and dump the input header files to disk.
@@ -561,7 +575,7 @@ impl BindgenOptions {
         self.parse_callbacks
             .iter()
             .filter_map(|cb| f(cb.as_ref()))
-            .last()
+            .next_back()
     }
 
     fn all_callbacks<T>(
@@ -580,9 +594,7 @@ impl BindgenOptions {
 
     fn process_comment(&self, comment: &str) -> String {
         let comment = comment::preprocess(comment);
-        self.parse_callbacks
-            .last()
-            .and_then(|cb| cb.process_comment(&comment))
+        self.last_callback(|cb| cb.process_comment(&comment))
             .unwrap_or(comment)
     }
 }
@@ -672,29 +684,44 @@ pub(crate) const HOST_TARGET: &str =
 fn rust_to_clang_target(rust_target: &str) -> Box<str> {
     const TRIPLE_HYPHENS_MESSAGE: &str = "Target triple should contain hyphens";
 
-    let mut clang_target = rust_target.to_owned();
+    let mut triple: Vec<&str> = rust_target.split_terminator('-').collect();
 
-    if clang_target.starts_with("riscv32") {
-        let idx = clang_target.find('-').expect(TRIPLE_HYPHENS_MESSAGE);
+    assert!(!triple.is_empty(), "{}", TRIPLE_HYPHENS_MESSAGE);
+    triple.resize(4, "");
 
-        clang_target.replace_range(..idx, "riscv32");
-    } else if clang_target.starts_with("riscv64") {
-        let idx = clang_target.find('-').expect(TRIPLE_HYPHENS_MESSAGE);
-
-        clang_target.replace_range(..idx, "riscv64");
-    } else if clang_target.starts_with("aarch64-apple-") {
-        let idx = clang_target.find('-').expect(TRIPLE_HYPHENS_MESSAGE);
-
-        clang_target.replace_range(..idx, "arm64");
+    // RISC-V
+    if triple[0].starts_with("riscv32") {
+        triple[0] = "riscv32";
+    } else if triple[0].starts_with("riscv64") {
+        triple[0] = "riscv64";
     }
 
-    if clang_target.ends_with("-espidf") {
-        let idx = clang_target.rfind('-').expect(TRIPLE_HYPHENS_MESSAGE);
-
-        clang_target.replace_range((idx + 1).., "elf");
+    // Apple
+    if triple[1] == "apple" {
+        if triple[0] == "aarch64" {
+            triple[0] = "arm64";
+        }
+        if triple[3] == "sim" {
+            triple[3] = "simulator";
+        }
     }
 
-    clang_target.into()
+    // ESP-IDF
+    if triple[2] == "espidf" {
+        triple[2] = "elf";
+    }
+
+    triple
+        .iter()
+        .skip(1)
+        .fold(triple[0].to_string(), |triple, part| {
+            if part.is_empty() {
+                triple
+            } else {
+                triple + "-" + part
+            }
+        })
+        .into()
 }
 
 /// Returns the effective target, and whether it was explicitly specified on the
@@ -727,7 +754,7 @@ impl Bindings {
     /// Generate bindings for the given options.
     pub(crate) fn generate(
         mut options: BindgenOptions,
-        input_unsaved_files: Vec<clang::UnsavedFile>,
+        input_unsaved_files: &[clang::UnsavedFile],
     ) -> Result<Bindings, BindgenError> {
         ensure_libclang_is_loaded();
 
@@ -769,7 +796,7 @@ impl Bindings {
                 0,
                 format!("--target={effective_target}").into_boxed_str(),
             );
-        };
+        }
 
         fn detect_include_paths(options: &mut BindgenOptions) {
             if !options.detect_include_paths {
@@ -835,7 +862,7 @@ impl Bindings {
             };
 
             if let Some(search_paths) = search_paths {
-                for path in search_paths.into_iter() {
+                for path in search_paths {
                     if let Ok(path) = path.into_os_string().into_string() {
                         options.clang_args.push("-isystem".into());
                         options.clang_args.push(path.into_boxed_str());
@@ -884,7 +911,7 @@ impl Bindings {
         debug!("Fixed-up options: {options:?}");
 
         let time_phases = options.time_phases;
-        let mut context = BindgenContext::new(options, &input_unsaved_files);
+        let mut context = BindgenContext::new(options, input_unsaved_files);
 
         if is_host_build {
             debug_assert_eq!(
@@ -953,7 +980,7 @@ impl Bindings {
     }
 
     /// Gets the rustfmt path to rustfmt the generated bindings.
-    fn rustfmt_path(&self) -> io::Result<Cow<PathBuf>> {
+    fn rustfmt_path(&self) -> io::Result<Cow<'_, PathBuf>> {
         debug_assert!(matches!(self.options.formatter, Formatter::Rustfmt));
         if let Some(ref p) = self.options.rustfmt_path {
             return Ok(Cow::Borrowed(p));
@@ -996,6 +1023,12 @@ impl Bindings {
         {
             cmd.args(["--config-path", path]);
         }
+
+        let edition = self
+            .options
+            .rust_edition
+            .unwrap_or_else(|| self.options.rust_target.latest_edition());
+        cmd.args(["--edition", &format!("{edition}")]);
 
         let mut child = cmd.spawn()?;
         let mut child_stdin = child.stdin.take().unwrap();
@@ -1138,8 +1171,9 @@ fn parse(context: &mut BindgenContext) -> Result<(), BindgenError> {
         cursor.visit_sorted(ctx, |ctx, child| parse_one(ctx, child, None));
     });
 
-    assert!(
-        context.current_module() == context.root_module(),
+    assert_eq!(
+        context.current_module(),
+        context.root_module(),
         "How did this happen?"
     );
     Ok(())
@@ -1175,7 +1209,7 @@ pub fn clang_version() -> ClangVersion {
                 };
             }
         }
-    };
+    }
     ClangVersion {
         parsed: None,
         full: raw_v.clone(),
@@ -1368,5 +1402,21 @@ fn test_rust_to_clang_target_espidf() {
     assert_eq!(
         rust_to_clang_target("xtensa-esp32-espidf").as_ref(),
         "xtensa-esp32-elf"
+    );
+}
+
+#[test]
+fn test_rust_to_clang_target_simulator() {
+    assert_eq!(
+        rust_to_clang_target("aarch64-apple-ios-sim").as_ref(),
+        "arm64-apple-ios-simulator"
+    );
+    assert_eq!(
+        rust_to_clang_target("aarch64-apple-tvos-sim").as_ref(),
+        "arm64-apple-tvos-simulator"
+    );
+    assert_eq!(
+        rust_to_clang_target("aarch64-apple-watchos-sim").as_ref(),
+        "arm64-apple-watchos-simulator"
     );
 }

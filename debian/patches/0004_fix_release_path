@@ -1,6 +1,6 @@
 --- a/Makefile
 +++ b/Makefile
-@@ -105,7 +105,7 @@
+@@ -119,7 +119,7 @@
  endif
  	mv target/release/libkrun.dylib target/release/$(KRUN_BASE_$(OS))
  endif

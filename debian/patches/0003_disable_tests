@@ -1,6 +1,6 @@
 --- a/Makefile
 +++ b/Makefile
-@@ -139,7 +139,3 @@
+@@ -157,7 +157,3 @@
  	rm -rf test-prefix
  	cd tests; $(CARGO) clean
  

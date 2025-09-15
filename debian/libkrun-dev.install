@@ -1,2 +1,3 @@
 usr/include/libkrun.h
 usr/lib/*/pkgconfig/libkrun.pc
+usr/include/libkrun_display.h

@@ -17,6 +17,7 @@ use super::module::Module;
 use super::template::{AsTemplateParam, TemplateParameters};
 use super::traversal::{EdgeKind, Trace, Tracer};
 use super::ty::{Type, TypeKind};
+use crate::callbacks::ItemInfo;
 use crate::clang;
 use crate::parse::{ClangSubItemParser, ParseError, ParseResult};
 
@@ -103,6 +104,7 @@ impl DebugOnlyItemSet {
         DebugOnlyItemSet
     }
 
+    #[allow(clippy::trivially_copy_pass_by_ref)]
     fn contains(&self, _id: &ItemId) -> bool {
         false
     }
@@ -726,7 +728,7 @@ impl Item {
         to.push_str(&self.canonical_name(ctx));
         if let ItemKind::Type(ref ty) = *self.kind() {
             if let TypeKind::TemplateInstantiation(ref inst) = *ty.kind() {
-                to.push_str(&format!("_open{level}_"));
+                let _ = write!(to, "_open{level}_");
                 for arg in inst.template_arguments() {
                     arg.into_resolver()
                         .through_type_refs()
@@ -734,7 +736,7 @@ impl Item {
                         .push_disambiguated_name(ctx, to, level + 1);
                     to.push('_');
                 }
-                to.push_str(&format!("close{level}"));
+                let _ = write!(to, "close{level}");
             }
         }
     }
@@ -921,8 +923,19 @@ impl Item {
         let name = names.join("_");
 
         let name = if opt.user_mangled == UserMangled::Yes {
+            let item_info = ItemInfo {
+                name: &name,
+                kind: match self.kind() {
+                    ItemKind::Module(..) => crate::callbacks::ItemKind::Module,
+                    ItemKind::Type(..) => crate::callbacks::ItemKind::Type,
+                    ItemKind::Function(..) => {
+                        crate::callbacks::ItemKind::Function
+                    }
+                    ItemKind::Var(..) => crate::callbacks::ItemKind::Var,
+                },
+            };
             ctx.options()
-                .last_callback(|callbacks| callbacks.item_name(&name))
+                .last_callback(|callbacks| callbacks.item_name(item_info))
                 .unwrap_or(name)
         } else {
             name
@@ -1012,15 +1025,15 @@ impl Item {
                 FunctionKind::Method(MethodKind::Constructor) => {
                     cc.constructors()
                 }
-                FunctionKind::Method(MethodKind::Destructor) |
-                FunctionKind::Method(MethodKind::VirtualDestructor {
-                    ..
-                }) => cc.destructors(),
-                FunctionKind::Method(MethodKind::Static) |
-                FunctionKind::Method(MethodKind::Normal) |
-                FunctionKind::Method(MethodKind::Virtual { .. }) => {
-                    cc.methods()
-                }
+                FunctionKind::Method(
+                    MethodKind::Destructor |
+                    MethodKind::VirtualDestructor { .. },
+                ) => cc.destructors(),
+                FunctionKind::Method(
+                    MethodKind::Static |
+                    MethodKind::Normal |
+                    MethodKind::Virtual { .. },
+                ) => cc.methods(),
             },
         }
     }
@@ -1415,7 +1428,7 @@ impl Item {
             CXCursor_UsingDirective |
             CXCursor_StaticAssert |
             CXCursor_FunctionTemplate => {
-                debug!("Unhandled cursor kind {:?}: {cursor:?}", cursor.kind(),);
+                debug!("Unhandled cursor kind {:?}: {cursor:?}", cursor.kind());
                 Err(ParseError::Continue)
             }
 
@@ -1589,10 +1602,7 @@ impl Item {
             canonical_def.unwrap_or_else(|| ty.declaration())
         };
 
-        let comment = location
-            .raw_comment()
-            .or_else(|| decl.raw_comment())
-            .or_else(|| location.raw_comment());
+        let comment = location.raw_comment().or_else(|| decl.raw_comment());
 
         let annotations =
             Annotations::new(&decl).or_else(|| Annotations::new(&location));
@@ -1856,16 +1866,11 @@ impl Item {
         let parent = ctx.root_module().into();
 
         if let Some(id) = ctx.get_type_param(&definition) {
-            if let Some(with_id) = with_id {
-                return Some(ctx.build_ty_wrapper(
-                    with_id,
-                    id,
-                    Some(parent),
-                    &ty,
-                ));
+            return Some(if let Some(with_id) = with_id {
+                ctx.build_ty_wrapper(with_id, id, Some(parent), &ty)
             } else {
-                return Some(id);
-            }
+                id
+            });
         }
 
         // See tests/headers/const_tparam.hpp and

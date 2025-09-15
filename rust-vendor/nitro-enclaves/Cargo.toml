@@ -12,13 +12,14 @@
 [package]
 edition = "2021"
 name = "nitro-enclaves"
-version = "0.2.0"
+version = "0.3.0"
 authors = ["The VirTEE Project Developers <virtee-security@redhat.com>"]
 build = false
 exclude = [
     ".gitignore",
     ".github/*",
 ]
+autolib = false
 autobins = false
 autoexamples = false
 autotests = false

@@ -243,7 +243,7 @@ impl Type {
     }
 
     /// Takes `name`, and returns a suitable identifier representation for it.
-    fn sanitize_name(name: &str) -> Cow<str> {
+    fn sanitize_name(name: &str) -> Cow<'_, str> {
         if clang::is_valid_identifier(name) {
             return Cow::Borrowed(name);
         }
@@ -504,7 +504,7 @@ fn is_invalid_type_param_invalid_remaining() {
 }
 
 #[test]
-#[should_panic]
+#[should_panic(expected = "Unnamed named type")]
 fn is_invalid_type_param_unnamed() {
     let ty = Type::new(None, None, TypeKind::TypeParam, false);
     assert!(ty.is_invalid_type_param());
@@ -512,7 +512,7 @@ fn is_invalid_type_param_unnamed() {
 
 #[test]
 fn is_invalid_type_param_empty_name() {
-    let ty = Type::new(Some("".into()), None, TypeKind::TypeParam, false);
+    let ty = Type::new(Some(String::new()), None, TypeKind::TypeParam, false);
     assert!(ty.is_invalid_type_param());
 }
 
@@ -1117,7 +1117,7 @@ impl Type {
 
                     TypeKind::Comp(complex)
                 }
-                CXType_Vector => {
+                CXType_Vector | CXType_ExtVector => {
                     let inner = Item::from_ty(
                         ty.elem_type().as_ref().unwrap(),
                         location,

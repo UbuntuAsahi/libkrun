@@ -17,7 +17,7 @@ use std::str::FromStr;
 
 const RUST_DERIVE_FUNPTR_LIMIT: usize = 12;
 
-/// What kind of a function are we looking at?
+/// What kind of function are we looking at?
 #[derive(Debug, Copy, Clone, PartialEq, Eq)]
 pub(crate) enum FunctionKind {
     /// A plain, free function.
@@ -247,8 +247,8 @@ pub(crate) enum ClangAbi {
 
 impl ClangAbi {
     /// Returns whether this Abi is known or not.
-    fn is_unknown(&self) -> bool {
-        matches!(*self, ClangAbi::Unknown(..))
+    fn is_unknown(self) -> bool {
+        matches!(self, ClangAbi::Unknown(..))
     }
 }
 
@@ -290,15 +290,15 @@ pub(crate) struct FunctionSig {
 fn get_abi(cc: CXCallingConv) -> ClangAbi {
     use clang_sys::*;
     match cc {
-        CXCallingConv_Default => ClangAbi::Known(Abi::C),
-        CXCallingConv_C => ClangAbi::Known(Abi::C),
+        CXCallingConv_Default | CXCallingConv_C => ClangAbi::Known(Abi::C),
         CXCallingConv_X86StdCall => ClangAbi::Known(Abi::Stdcall),
         CXCallingConv_X86FastCall => ClangAbi::Known(Abi::Fastcall),
         CXCallingConv_X86ThisCall => ClangAbi::Known(Abi::ThisCall),
-        CXCallingConv_X86VectorCall => ClangAbi::Known(Abi::Vectorcall),
+        CXCallingConv_X86VectorCall | CXCallingConv_AArch64VectorCall => {
+            ClangAbi::Known(Abi::Vectorcall)
+        }
         CXCallingConv_AAPCS => ClangAbi::Known(Abi::Aapcs),
         CXCallingConv_X86_64Win64 => ClangAbi::Known(Abi::Win64),
-        CXCallingConv_AArch64VectorCall => ClangAbi::Known(Abi::Vectorcall),
         other => ClangAbi::Unknown(other),
     }
 }
@@ -433,7 +433,7 @@ impl FunctionSig {
             spelling.starts_with("operator") &&
                 !clang::is_valid_identifier(spelling)
         };
-        if is_operator(&spelling) {
+        if is_operator(&spelling) && !ctx.options().represent_cxx_operators {
             return Err(ParseError::Continue);
         }
 
@@ -533,7 +533,10 @@ impl FunctionSig {
             let is_const = is_method && cursor.method_is_const();
             let is_virtual = is_method && cursor.method_is_virtual();
             let is_static = is_method && cursor.method_is_static();
-            if !is_static && !is_virtual {
+            if !is_static &&
+                (!is_virtual ||
+                    ctx.options().use_specific_virtual_function_receiver)
+            {
                 let parent = cursor.semantic_parent();
                 let class = Item::parse(parent, None, ctx)
                     .expect("Expected to parse the class");
@@ -731,8 +734,9 @@ impl ClangSubItemParser for Function {
         if visibility != CXVisibility_Default {
             return Err(ParseError::Continue);
         }
-
-        if cursor.access_specifier() == CX_CXXPrivate {
+        if cursor.access_specifier() == CX_CXXPrivate &&
+            !context.options().generate_private_functions
+        {
             return Err(ParseError::Continue);
         }
 
@@ -752,7 +756,9 @@ impl ClangSubItemParser for Function {
                 return Err(ParseError::Continue);
             }
 
-            if cursor.is_deleted_function() {
+            if cursor.is_deleted_function() &&
+                !context.options().generate_deleted_functions
+            {
                 return Err(ParseError::Continue);
             }
 

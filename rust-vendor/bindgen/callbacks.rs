@@ -4,6 +4,8 @@ pub use crate::ir::analysis::DeriveTrait;
 pub use crate::ir::derive::CanDerive as ImplementsTrait;
 pub use crate::ir::enum_ty::{EnumVariantCustomBehavior, EnumVariantValue};
 pub use crate::ir::int::IntKind;
+pub use cexpr::token::Kind as TokenKind;
+pub use cexpr::token::Token;
 use std::fmt;
 
 /// An enum to allow ignoring parsing of macros.
@@ -49,6 +51,9 @@ pub trait ParseCallbacks: fmt::Debug {
         None
     }
 
+    /// Modify the contents of a macro
+    fn modify_macro(&self, _name: &str, _tokens: &mut Vec<Token>) {}
+
     /// The integer kind an integer macro should have, given a name and the
     /// value of that macro, or `None` if you want the default to be chosen.
     fn int_macro(&self, _name: &str, _value: i64) -> Option<IntKind> {
@@ -89,8 +94,8 @@ pub trait ParseCallbacks: fmt::Debug {
         None
     }
 
-    /// Allows to rename an item, replacing `_original_item_name`.
-    fn item_name(&self, _original_item_name: &str) -> Option<String> {
+    /// Allows to rename an item, replacing `_item_info.name`.
+    fn item_name(&self, _item_info: ItemInfo) -> Option<String> {
         None
     }
 
@@ -217,7 +222,28 @@ pub enum DiscoveredItem {
 
         /// The identifier of the discovered type
         alias_for: DiscoveredItemId,
-    }, // functions, modules, etc.
+    },
+
+    /// Represents an enum.
+    Enum {
+        /// The final name of the generated binding
+        final_name: String,
+    },
+
+    /// A function or method.
+    Function {
+        /// The final name used.
+        final_name: String,
+    },
+
+    /// A method.
+    Method {
+        /// The final name used.
+        final_name: String,
+
+        /// Type to which this method belongs.
+        parent: DiscoveredItemId,
+    }, // modules, etc.
 }
 
 /// Relevant information about a type to which new derive attributes will be added using
@@ -254,6 +280,7 @@ pub enum TypeKind {
 }
 
 /// A struct providing information about the item being passed to [`ParseCallbacks::generated_name_override`].
+#[derive(Clone, Copy)]
 #[non_exhaustive]
 pub struct ItemInfo<'a> {
     /// The name of the item
@@ -263,8 +290,13 @@ pub struct ItemInfo<'a> {
 }
 
 /// An enum indicating the kind of item for an `ItemInfo`.
+#[derive(Clone, Copy)]
 #[non_exhaustive]
 pub enum ItemKind {
+    /// A module
+    Module,
+    /// A type
+    Type,
     /// A Function
     Function,
     /// A Variable

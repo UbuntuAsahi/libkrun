@@ -2,7 +2,9 @@
 # debian/rules for the Debian libkrunfw package
 # Copyright © 2024 Andreas Schröder <andreas@kernelpanik.net>
 
-export CARGO = /usr/share/cargo/bin/cargo
+# export CARGO = /usr/share/cargo/bin/cargo
+# export CARGO = /usr/bin/cargo-1.82
+export CARGO = /usr/lib/rust-1.82/share/cargo/bin/cargo
 export CARGO_VENDOR_DIR = rust-vendor
 export CARGO_HOME = $(CURDIR)/debian/cargo_home
 
