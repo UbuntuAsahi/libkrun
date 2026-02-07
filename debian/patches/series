@@ -4,3 +4,5 @@
 0004_fix_release_path
 0005-krun_display_rust_edition.patch
 0006-rutabaga_gfx_virgl_renderer_resource_map_fixed.patch
+0007-cargo_lock_version.patch
+0008-remove-libkrun.pc
