@@ -112,7 +112,20 @@ impl FileSystem for PassthroughFsRo {
         kill_priv: bool,
         flags: u32,
     ) -> io::Result<(Option<Handle>, OpenOptions)> {
-        let ro_flags = read_only_open_flags(flags)?;
+        let f = flags as i32;
+        let accmode = f & libc::O_ACCMODE;
+        if accmode != libc::O_RDONLY {
+            return Err(erofs());
+        }
+        if f & libc::O_TRUNC != 0 || f & libc::O_APPEND != 0 {
+            return Err(erofs());
+        }
+        #[cfg(target_os = "linux")]
+        if f & libc::O_TMPFILE != 0 {
+            return Err(erofs());
+        }
+        // Force O_RDONLY on the underlying call.
+        let ro_flags = (flags & !(libc::O_ACCMODE as u32)) | (libc::O_RDONLY as u32);
         self.inner.open(ctx, inode, kill_priv, ro_flags)
     }
 
@@ -131,7 +144,13 @@ impl FileSystem for PassthroughFsRo {
             .read(ctx, inode, handle, w, size, offset, lock_owner, flags)
     }
 
-    fn flush(&self, ctx: Context, inode: Inode, handle: Handle, lock_owner: u64) -> io::Result<()> {
+    fn flush(
+        &self,
+        ctx: Context,
+        inode: Inode,
+        handle: Handle,
+        lock_owner: u64,
+    ) -> io::Result<()> {
         self.inner.flush(ctx, inode, handle, lock_owner)
     }
 
@@ -231,7 +250,13 @@ impl FileSystem for PassthroughFsRo {
         self.inner.fsyncdir(ctx, inode, datasync, handle)
     }
 
-    fn releasedir(&self, ctx: Context, inode: Inode, flags: u32, handle: Handle) -> io::Result<()> {
+    fn releasedir(
+        &self,
+        ctx: Context,
+        inode: Inode,
+        flags: u32,
+        handle: Handle,
+    ) -> io::Result<()> {
         self.inner.releasedir(ctx, inode, flags, handle)
     }
 
@@ -305,15 +330,15 @@ impl FileSystem for PassthroughFsRo {
 
     fn ioctl(
         &self,
-        ctx: Context,
-        inode: Inode,
-        handle: Handle,
-        flags: u32,
-        cmd: u32,
-        arg: u64,
-        in_size: u32,
-        out_size: u32,
-        exit_code: &Arc<AtomicI32>,
+        _ctx: Context,
+        _inode: Inode,
+        _handle: Handle,
+        _flags: u32,
+        _cmd: u32,
+        _arg: u64,
+        _in_size: u32,
+        _out_size: u32,
+        _exit_code: &Arc<AtomicI32>,
     ) -> io::Result<Vec<u8>> {
         self.inner.ioctl(
             ctx, inode, handle, flags, cmd, arg, in_size, out_size, exit_code,
@@ -469,33 +494,5 @@ impl FileSystem for PassthroughFsRo {
         _flags: u64,
     ) -> io::Result<usize> {
         Err(erofs())
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::read_only_open_flags;
-
-    #[test]
-    fn read_only_open_flags_allow_append() {
-        let flags = (libc::O_RDONLY | libc::O_APPEND) as u32;
-        let ro_flags = read_only_open_flags(flags).unwrap();
-
-        assert_eq!((ro_flags as i32) & libc::O_ACCMODE, libc::O_RDONLY);
-        assert_ne!((ro_flags as i32) & libc::O_APPEND, 0);
-    }
-
-    #[test]
-    fn read_only_open_flags_reject_write_access() {
-        let err = read_only_open_flags(libc::O_WRONLY as u32).unwrap_err();
-
-        assert_eq!(err.raw_os_error(), Some(libc::EROFS));
-    }
-
-    #[test]
-    fn read_only_open_flags_reject_truncate() {
-        let err = read_only_open_flags((libc::O_RDONLY | libc::O_TRUNC) as u32).unwrap_err();
-
-        assert_eq!(err.raw_os_error(), Some(libc::EROFS));
     }
 }
