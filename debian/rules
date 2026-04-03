@@ -87,11 +87,11 @@ override_dh_auto_clean:
 	/usr/bin/cargo-$(RUST_VER) clean
 	rm -rf $(CARGO_HOME)
 
-# override_dh_clean:
-# # 	/usr/lib/rust-$(RUST_VER)/share/cargo/bin/cargo clean
-# # 	dh_clean -XCargo.toml.orig
-# 	/usr/bin/cargo-$(RUST_VER) clean
-# 	rm -rf $(CARGO_HOME)
+override_dh_clean:
+# 	/usr/lib/rust-$(RUST_VER)/share/cargo/bin/cargo clean
+	dh_clean -XCargo.toml.orig
+	/usr/bin/cargo-$(RUST_VER) clean
+	rm -rf $(CARGO_HOME)
 
 # override_cargo_clean:
 # 	/usr/bin/cargo-1.85 clean
