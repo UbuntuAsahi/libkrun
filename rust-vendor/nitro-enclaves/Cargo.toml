@@ -12,7 +12,7 @@
 [package]
 edition = "2021"
 name = "nitro-enclaves"
-version = "0.3.0"
+version = "0.6.0"
 authors = ["The VirTEE Project Developers <virtee-security@redhat.com>"]
 build = false
 exclude = [
@@ -54,9 +54,6 @@ features = [
     "ioctl",
     "poll",
 ]
-
-[dependencies.rand]
-version = "0.9.0"
 
 [dependencies.vsock]
 version = "0.5.1"

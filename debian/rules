@@ -3,13 +3,17 @@
 # Copyright © 2024 Andreas Schröder <andreas@kernelpanik.net>
 
 # export CARGO = /usr/share/cargo/bin/cargo
-# export CARGO = /usr/bin/cargo-1.82
-export CARGO = /usr/lib/rust-1.82/share/cargo/bin/cargo
+
+export RUST_VER = $(shell cat debian/rust_version.txt)
+
+# export CARGO = /usr/bin/cargo-$(RUST_VER)
+export CARGO = /usr/lib/rust-$(RUST_VER)/share/cargo/bin/cargo
+# export PATH := /usr/lib/rust-$(RUST_VER)/share/cargo/bin:$(PATH)
 export CARGO_VENDOR_DIR = rust-vendor
 export CARGO_HOME = $(CURDIR)/debian/cargo_home
 
 include /usr/share/dpkg/pkg-info.mk
-include /usr/share/rustc-1.82/architecture.mk
+include /usr/share/rustc-$(RUST_VER)/architecture.mk
 export DEB_HOST_RUST_TYPE DEB_HOST_GNU_TYPE
 
 
@@ -22,7 +26,7 @@ vendor-tarball-sanity-check:
 	fi
 
 # use specific rustc path
-export RUSTC:=/usr/bin/rustc-1.82
+export RUSTC:=/usr/bin/rustc-$(RUST_VER)
 
 vendor-deps:
 	if QUILT_PATCHES=debian/patches quilt applied | grep vendor-remove-unused-deps ; then \
@@ -31,7 +35,7 @@ vendor-deps:
 	fi
 
 	rm -rf $(CARGO_VENDOR_DIR)
-	cargo vendor --manifest-path src/libkrun/Cargo.toml $(CARGO_VENDOR_DIR)
+	/usr/bin/cargo-$(RUST_VER) vendor --manifest-path src/libkrun/Cargo.toml $(CARGO_VENDOR_DIR)
 
 	# lintian: source-contains-prebuilt-windows-binary
 	rm -r \
@@ -62,7 +66,15 @@ override_dh_auto_configure:
 	sed -i 's/LIBDIR_Linux = lib64$$/LIBDIR_Linux = lib\/$(DEB_HOST_MULTIARCH)/' Makefile
 	dh_auto_configure
 
+# override_dh_auto_build:
+# 	true
+# 	CARGO=/usr/bin/cargo-${RUST_VER}
+# 	echo ${CARGO}
+
 override_dh_auto_build:
+# 	sed -i 's/edition = "2021"/edition = "2024"/' src/rutabaga_gfx/Cargo.toml
+# 	CARGO=/usr/bin/cargo-${RUST_VER}
+# 	echo ${CARGO}
 	dh_auto_build -- GPU=1 VIRGL_RESOURCE_MAP2=1 BLK=1 NET=1 SND=1
 
 override_dh_dwz:
@@ -71,6 +83,15 @@ override_dh_dwz:
 override_dh_strip:
 	true
 
-override_dh_clean:
-	dh_clean
+override_dh_auto_clean:
+	/usr/bin/cargo-$(RUST_VER) clean
 	rm -rf $(CARGO_HOME)
+
+# override_dh_clean:
+# # 	/usr/lib/rust-$(RUST_VER)/share/cargo/bin/cargo clean
+# # 	dh_clean -XCargo.toml.orig
+# 	/usr/bin/cargo-$(RUST_VER) clean
+# 	rm -rf $(CARGO_HOME)
+
+# override_cargo_clean:
+# 	/usr/bin/cargo-1.85 clean

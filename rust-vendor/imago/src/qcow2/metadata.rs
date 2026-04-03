@@ -5,8 +5,8 @@ use crate::io_buffers::IoBuffer;
 use crate::macros::numerical_enum;
 use crate::misc_helpers::invalid_data;
 use crate::{Storage, StorageExt};
-use bincode::Options;
-use serde::{Deserialize, Serialize};
+use bincode::config::{BigEndian, Configuration as BincodeConfiguration, Fixint};
+use bincode::{Decode, Encode};
 use std::collections::HashMap;
 use std::mem::size_of;
 use std::num::TryFromIntError;
@@ -16,7 +16,7 @@ use tokio::sync::{Mutex, MutexGuard};
 use tracing::error;
 
 /// Qcow header magic ("QFI\xfb").
-const MAGIC: u32 = 0x51_46_49_fb;
+pub(super) const MAGIC: u32 = 0x51_46_49_fb;
 
 /// Maximum file length.
 const MAX_FILE_LENGTH: u64 = 0x0100_0000_0000_0000u64;
@@ -40,8 +40,13 @@ pub(super) const MIN_REFCOUNT_WIDTH: usize = 1;
 /// Maximum number of bits per refcount entry.
 pub(super) const MAX_REFCOUNT_WIDTH: usize = 64;
 
+/// Bincode configuration for the qcow2 integer format
+const BINCODE_CFG: BincodeConfiguration<BigEndian, Fixint> = bincode::config::standard()
+    .with_fixed_int_encoding()
+    .with_big_endian();
+
 /// Qcow2 v2 header.
-#[derive(Deserialize, Serialize)]
+#[derive(Decode, Encode)]
 struct V2Header {
     /// Qcow magic string ("QFI\xfb").
     magic: u32,
@@ -77,7 +82,7 @@ struct V2Header {
     /// byte cluster size, it is unable to populate a virtual size larger than 128 GB (37 bits).
     /// Meanwhile, L1/L2 table layouts limit an image to no more than 64 PB (56 bits) of populated
     /// clusters, and an image may hit other limits first (such as a file system’s maximum size).
-    size: u64,
+    size: AtomicU64,
 
     /// Encryption method:
     ///
@@ -114,7 +119,7 @@ impl V2Header {
 }
 
 /// Qcow2 v3 header.
-#[derive(Deserialize, Serialize)]
+#[derive(Decode, Encode)]
 struct V3HeaderBase {
     /// Bitmask of incompatible features.  An implementation must fail to open an image if an
     /// unknown bit is set.
@@ -202,6 +207,51 @@ numerical_enum! {
     }
 }
 
+impl From<IncompatibleFeatures> for (FeatureType, u8) {
+    /// Get this feature’s feature name table key.
+    fn from(feat: IncompatibleFeatures) -> (FeatureType, u8) {
+        assert!((feat as u64).is_power_of_two());
+        (
+            FeatureType::Incompatible,
+            (feat as u64).trailing_zeros() as u8,
+        )
+    }
+}
+
+numerical_enum! {
+    /// Compatible feature bits.
+    pub(super) enum CompatibleFeatures as u64 {
+        LazyRefcounts = 1 << 0,
+    }
+}
+
+impl From<CompatibleFeatures> for (FeatureType, u8) {
+    /// Get this feature’s feature name table key.
+    fn from(feat: CompatibleFeatures) -> (FeatureType, u8) {
+        assert!((feat as u64).is_power_of_two());
+        (
+            FeatureType::Compatible,
+            (feat as u64).trailing_zeros() as u8,
+        )
+    }
+}
+
+numerical_enum! {
+    /// Autoclear feature bits.
+    pub(super) enum AutoclearFeatures as u64 {
+        Bitmaps = 1 << 0,
+        RawExternalData = 1 << 1,
+    }
+}
+
+impl From<AutoclearFeatures> for (FeatureType, u8) {
+    /// Get this feature’s feature name table key.
+    fn from(feat: AutoclearFeatures) -> (FeatureType, u8) {
+        assert!((feat as u64).is_power_of_two());
+        (FeatureType::Autoclear, (feat as u64).trailing_zeros() as u8)
+    }
+}
+
 numerical_enum! {
     /// Extension type IDs.
     pub(super) enum HeaderExtensionType as u32 {
@@ -220,7 +270,7 @@ numerical_enum! {
 }
 
 /// Header for a header extension.
-#[derive(Default, Deserialize, Serialize)]
+#[derive(Default, Decode, Encode)]
 struct HeaderExtensionHeader {
     /// Type code of the header extension.
     extension_type: u32,
@@ -291,14 +341,11 @@ impl Header {
     ///
     /// If `writable` is false, do not perform any modifications (e.g. clearing auto-clear bits).
     pub async fn load<S: Storage>(image: &S, writable: bool) -> io::Result<Self> {
-        let bincode = bincode::DefaultOptions::new()
-            .with_fixint_encoding()
-            .with_big_endian();
-
+        // TODO: More sanity checks.
         let mut header_buf = vec![0u8; V2Header::RAW_SIZE];
         image.read(header_buf.as_mut_slice(), 0).await?;
 
-        let header: V2Header = bincode.deserialize(&header_buf).map_err(invalid_data)?;
+        let header: V2Header = decode_binary(&header_buf)?;
         if header.magic != MAGIC {
             return Err(invalid_data("Not a qcow2 file"));
         }
@@ -310,7 +357,7 @@ impl Header {
             image
                 .read(header_buf.as_mut_slice(), V2Header::RAW_SIZE as u64)
                 .await?;
-            bincode.deserialize(&header_buf).map_err(invalid_data)?
+            decode_binary(&header_buf)?
         } else {
             return Err(invalid_data(format!(
                 "qcow2 v{} is not supported",
@@ -323,21 +370,20 @@ impl Header {
         })?;
         if !(MIN_CLUSTER_SIZE..=MAX_CLUSTER_SIZE).contains(&cluster_size) {
             return Err(invalid_data(format!(
-                "Invalid cluster size: {}; must be between {} and {}",
-                cluster_size, MIN_CLUSTER_SIZE, MAX_CLUSTER_SIZE,
+                "Invalid cluster size: {cluster_size}; must be between {MIN_CLUSTER_SIZE} and {MAX_CLUSTER_SIZE}",
             )));
         }
 
         let min_header_size = V2Header::RAW_SIZE + V3HeaderBase::RAW_SIZE;
         if (v3header_base.header_length as usize) < min_header_size {
             return Err(invalid_data(format!(
-                "qcow2 header too short: {} < {}",
-                v3header_base.header_length, min_header_size,
+                "qcow2 header too short: {} < {min_header_size}",
+                v3header_base.header_length,
             )));
         } else if (v3header_base.header_length as usize) > cluster_size {
             return Err(invalid_data(format!(
-                "qcow2 header too big: {} > {}",
-                v3header_base.header_length, cluster_size,
+                "qcow2 header too big: {} > {cluster_size}",
+                v3header_base.header_length,
             )));
         }
 
@@ -372,8 +418,7 @@ impl Header {
             })?;
         if !(MIN_REFCOUNT_WIDTH..=MAX_REFCOUNT_WIDTH).contains(&rc_width) {
             return Err(invalid_data(format!(
-                "Invalid refcount width: {}; must be between {} and {}",
-                rc_width, MIN_REFCOUNT_WIDTH, MAX_REFCOUNT_WIDTH,
+                "Invalid refcount width: {rc_width}; must be between {MIN_REFCOUNT_WIDTH} and {MAX_REFCOUNT_WIDTH}",
             )));
         }
 
@@ -420,8 +465,7 @@ impl Header {
 
                 ext_offset += HeaderExtensionHeader::RAW_SIZE as u64;
 
-                let ext_hdr: HeaderExtensionHeader =
-                    bincode.deserialize(&ext_hdr_buf).map_err(invalid_data)?;
+                let ext_hdr: HeaderExtensionHeader = decode_binary(&ext_hdr_buf)?;
                 let ext_end = ext_offset
                     .checked_add(ext_hdr.length as u64)
                     .ok_or_else(|| invalid_data("Header size overflow"))?;
@@ -455,8 +499,7 @@ impl Header {
             });
             if let Some(conflicting) = conflicting {
                 return Err(io::Error::other(format!(
-                    "Found conflicting backing file formats: {:?} != {:?}",
-                    backing_fmt, conflicting
+                    "Found conflicting backing file formats: {backing_fmt:?} != {conflicting:?}",
                 )));
             }
         }
@@ -469,8 +512,7 @@ impl Header {
             });
             if let Some(conflicting) = conflicting {
                 return Err(io::Error::other(format!(
-                    "Found conflicting external data file names: {:?} != {:?}",
-                    ext_data_file, conflicting
+                    "Found conflicting external data file names: {ext_data_file:?} != {conflicting:?}",
                 )));
             }
         }
@@ -520,13 +562,9 @@ impl Header {
 
     /// Write the qcow2 header to disk.
     pub async fn write<S: Storage>(&mut self, image: &S) -> io::Result<()> {
-        let bincode = bincode::DefaultOptions::new()
-            .with_fixint_encoding()
-            .with_big_endian();
-
         let header_len = if self.v2.version > 2 {
-            let len = bincode.serialized_size(&self.v2).unwrap() as usize
-                + bincode.serialized_size(&self.v3).unwrap() as usize
+            let len = encoded_size(&self.v2).unwrap()
+                + encoded_size(&self.v3).unwrap()
                 + self.unknown_header_fields.len();
             let len = len.next_multiple_of(8);
             self.v3.header_length = len as u32;
@@ -535,29 +573,54 @@ impl Header {
             V2Header::RAW_SIZE
         };
 
-        let mut header_exts = self.serialize_extensions()?;
+        // If the header gets too long, try to remove the feature name table to make it small
+        // enough
+        let mut header_exts;
+        let mut backing_file_ofs;
+        loop {
+            header_exts = self.serialize_extensions()?;
+
+            backing_file_ofs = header_len
+                .checked_add(header_exts.len())
+                .ok_or_else(|| invalid_data("Header size overflow"))?;
+            let backing_file_len = self
+                .backing_filename
+                .as_ref()
+                .map(|n| n.len()) // length in bytes
+                .unwrap_or(0);
+            let header_end = backing_file_ofs
+                .checked_add(backing_file_len)
+                .ok_or_else(|| invalid_data("Header size overflow"))?;
+
+            if header_end <= self.cluster_size() {
+                break;
+            }
+
+            if !self
+                .extensions
+                .iter()
+                .any(|e| e.extension_type() == HeaderExtensionType::FeatureNameTable as u32)
+            {
+                return Err(io::Error::other(format!(
+                    "Header would be too long ({header_end} > {})",
+                    self.cluster_size()
+                )));
+            }
+            self.extensions
+                .retain(|e| e.extension_type() != HeaderExtensionType::FeatureNameTable as u32);
+        }
 
         if let Some(backing) = self.backing_filename.as_ref() {
-            let offset = header_len + header_exts.len();
-            let size = backing.len(); // length in bytes
-            let end = offset.checked_add(size).ok_or_else(|| {
-                io::Error::other("Header plus header extensions plus backing filename is too long")
-            })?;
-            if end > self.cluster_size() {
-                return Err(io::Error::other(
-                    "Header plus header extensions plus backing filename is too long",
-                ))?;
-            }
-            self.v2.backing_file_offset = offset as u64;
-            self.v2.backing_file_size = size as u32;
+            self.v2.backing_file_offset = backing_file_ofs as u64;
+            self.v2.backing_file_size = backing.len() as u32; // length in bytes
         } else {
             self.v2.backing_file_offset = 0;
             self.v2.backing_file_size = 0;
-        }
+        };
 
-        let mut full_buf = bincode.serialize(&self.v2).map_err(invalid_data)?;
+        let mut full_buf = encode_binary(&self.v2)?;
         if self.v2.version > 2 {
-            full_buf.append(&mut bincode.serialize(&self.v3).map_err(invalid_data)?);
+            full_buf.append(&mut encode_binary(&self.v3)?);
             full_buf.extend_from_slice(&self.unknown_header_fields);
             full_buf.resize(full_buf.len().next_multiple_of(8), 0);
         }
@@ -579,9 +642,166 @@ impl Header {
         image.write(&full_buf, 0).await
     }
 
+    /// Create a header for a new image.
+    pub fn new(
+        cluster_bits: u32,
+        refcount_order: u32,
+        backing_filename: Option<String>,
+        backing_format: Option<String>,
+        external_data_file: Option<String>,
+    ) -> Self {
+        assert!((MIN_CLUSTER_SIZE..=MAX_CLUSTER_SIZE)
+            .contains(&1usize.checked_shl(cluster_bits).unwrap()));
+        assert!((MIN_REFCOUNT_WIDTH..=MAX_REFCOUNT_WIDTH)
+            .contains(&1usize.checked_shl(refcount_order).unwrap()));
+
+        let has_external_data_file = external_data_file.is_some();
+        let incompatible_features = if has_external_data_file {
+            IncompatibleFeatures::ExternalDataFile as u64
+        } else {
+            0
+        };
+
+        let mut extensions = vec![HeaderExtension::feature_name_table()];
+        if let Some(backing_format) = backing_format {
+            extensions.push(HeaderExtension::BackingFileFormat(backing_format));
+        }
+        if let Some(external_data_file) = external_data_file {
+            extensions.push(HeaderExtension::ExternalDataFileName(external_data_file));
+        }
+
+        Header {
+            v2: V2Header {
+                magic: MAGIC,
+                version: 3,
+                backing_file_offset: 0, // will be set by `Self::write()`
+                backing_file_size: 0,   // will be set by `Self::write()`
+                cluster_bits,
+                size: 0.into(),
+                crypt_method: 0,
+                l1_size: 0.into(),
+                l1_table_offset: 0.into(),
+                refcount_table_offset: 0.into(),
+                refcount_table_clusters: 0.into(),
+                nb_snapshots: 0,
+                snapshots_offset: 0,
+            },
+            v3: V3HeaderBase {
+                incompatible_features,
+                compatible_features: 0,
+                autoclear_features: 0,
+                refcount_order,
+                header_length: 0, // will be set by `Self::write()`
+            },
+            unknown_header_fields: Vec::new(),
+            backing_filename,
+            extensions,
+            external_data_file: has_external_data_file,
+        }
+    }
+
+    /// Update from a newly loaded header.
+    ///
+    /// Checks whether fields we consider immutable have remained the same, and updates mutable
+    /// fields.
+    pub fn update(&self, new_header: &Header) -> io::Result<()> {
+        /// Verify that the given field matches in `self` and `new_header`.
+        macro_rules! check_field {
+            ($($field:ident).*) => {
+                (self.$($field).* == new_header.$($field).*).then_some(()).ok_or_else(|| {
+                    io::Error::other(format!(
+                        "Incompatible header modification on {}: {} != {}",
+                        stringify!($($field).*),
+                        self.$($field).*,
+                        new_header.$($field).*
+                    ))
+                })
+            };
+        }
+
+        check_field!(v2.magic)?;
+        check_field!(v2.version)?;
+        check_field!(v2.backing_file_offset)?; // TODO: Should be mutable
+        check_field!(v2.backing_file_size)?; // TODO: Should be mutable
+        check_field!(v2.cluster_bits)?;
+        // Size is mutable
+        // L1 position is mutable
+        // Reftable position is mutable
+        check_field!(v2.crypt_method)?;
+        check_field!(v2.nb_snapshots)?; // TODO: Should be mutable
+        check_field!(v2.snapshots_offset)?; // TODO: Should be mutable
+        check_field!(v3.incompatible_features)?; // TODO: Should be mutable
+        check_field!(v3.compatible_features)?; // TODO: Should be mutable
+        check_field!(v3.autoclear_features)?; // TODO: Should be mutable
+        check_field!(v3.refcount_order)?;
+        // header length is OK to ignore (as long as it’s valid)
+
+        // TODO: Should be mutable
+        (self.unknown_header_fields == new_header.unknown_header_fields)
+            .then_some(())
+            .ok_or_else(|| io::Error::other("Unknown header fields modified"))?;
+        // TODO: Should be mutable
+        (self.backing_filename == new_header.backing_filename)
+            .then_some(())
+            .ok_or_else(|| io::Error::other("Backing filename modified"))?;
+        // TODO: Should be mutable
+        (self.extensions == new_header.extensions)
+            .then_some(())
+            .ok_or_else(|| io::Error::other("Header extensions modified"))?;
+
+        check_field!(external_data_file)?;
+
+        self.v2.size.store(
+            new_header.v2.size.load(Ordering::Relaxed),
+            Ordering::Relaxed,
+        );
+
+        self.v2.l1_table_offset.store(
+            new_header.v2.l1_table_offset.load(Ordering::Relaxed),
+            Ordering::Relaxed,
+        );
+        self.v2.l1_size.store(
+            new_header.v2.l1_size.load(Ordering::Relaxed),
+            Ordering::Relaxed,
+        );
+        self.v2.refcount_table_offset.store(
+            new_header.v2.refcount_table_offset.load(Ordering::Relaxed),
+            Ordering::Relaxed,
+        );
+        self.v2.refcount_table_clusters.store(
+            new_header
+                .v2
+                .refcount_table_clusters
+                .load(Ordering::Relaxed),
+            Ordering::Relaxed,
+        );
+
+        Ok(())
+    }
+
     /// Guest disk size.
     pub fn size(&self) -> u64 {
-        self.v2.size
+        self.v2.size.load(Ordering::Relaxed)
+    }
+
+    /// Require a minimum qcow2 version.
+    ///
+    /// Return an error if the version requirement is not met.
+    pub fn require_version(&self, minimum: u32) -> io::Result<()> {
+        let version = self.v2.version;
+        if version >= minimum {
+            Ok(())
+        } else {
+            Err(io::Error::new(
+                io::ErrorKind::Unsupported,
+                format!("qcow2 version {minimum} required, image has version {version}"),
+            ))
+        }
+    }
+
+    /// Set the guest disk size.
+    pub fn set_size(&self, new_size: u64) {
+        self.v2.size.store(new_size, Ordering::Relaxed)
     }
 
     /// log2 of the cluster size.
@@ -602,8 +822,10 @@ impl Header {
 
     /// log2 of the number of entries per refcount block.
     pub fn rb_bits(&self) -> u32 {
-        // log2(cluster_size >> (refcount_order - 3))
-        self.cluster_bits() - (self.refcount_order() - 3)
+        // log2(cluster_size / (refcount_bits / 8 bits per byte))
+        // = log2(cluster_size * 8 / refcount_bits)
+        // = log2(cluster_size) + log2(8) - log2(refcount_bits)
+        self.cluster_bits() + 3 - self.refcount_order()
     }
 
     /// Number of entries per refcount block.
@@ -731,24 +953,16 @@ impl Header {
 
     /// Serialize all header extensions.
     fn serialize_extensions(&self) -> io::Result<Vec<u8>> {
-        let bincode = bincode::DefaultOptions::new()
-            .with_fixint_encoding()
-            .with_big_endian();
-
         let mut result = Vec::new();
         for e in &self.extensions {
             let mut data = e.serialize_data()?;
             let ext_hdr = HeaderExtensionHeader {
                 extension_type: e.extension_type(),
                 length: data.len().try_into().map_err(|err| {
-                    invalid_data(format!(
-                        "Header extension too long ({}): {}",
-                        data.len(),
-                        err
-                    ))
+                    invalid_data(format!("Header extension too long ({}): {err}", data.len()))
                 })?,
             };
-            result.append(&mut bincode.serialize(&ext_hdr).map_err(invalid_data)?);
+            result.append(&mut encode_binary(&ext_hdr)?);
             result.append(&mut data);
             result.resize(result.len().next_multiple_of(8), 0);
         }
@@ -757,7 +971,7 @@ impl Header {
             extension_type: HeaderExtensionType::End as u32,
             length: 0,
         };
-        result.append(&mut bincode.serialize(&end_ext).map_err(invalid_data)?);
+        result.append(&mut encode_binary(&end_ext)?);
         result.resize(result.len().next_multiple_of(8), 0);
 
         Ok(result)
@@ -765,11 +979,7 @@ impl Header {
 
     /// Helper for functions that just need to change little bits in the v2 header part.
     async fn write_v2_header<S: Storage>(&self, image: &S) -> io::Result<()> {
-        let bincode = bincode::DefaultOptions::new()
-            .with_fixint_encoding()
-            .with_big_endian();
-
-        let v2_header = bincode.serialize(&self.v2).map_err(invalid_data)?;
+        let v2_header = encode_binary(&self.v2)?;
         image.write(&v2_header, 0).await
     }
 
@@ -782,6 +992,12 @@ impl Header {
     /// Write the L1 table pointer (offset and size) to disk.
     pub async fn write_l1_table_pointer<S: Storage>(&self, image: &S) -> io::Result<()> {
         // TODO: Just write the L1 table offset and size
+        self.write_v2_header(image).await
+    }
+
+    /// Write the guest disk size to disk.
+    pub async fn write_size<S: Storage>(&self, image: &S) -> io::Result<()> {
+        // TODO: Just write the size
         self.write_v2_header(image).await
     }
 }
@@ -874,6 +1090,29 @@ impl HeaderExtension {
             } => Ok(data.clone()),
         }
     }
+
+    /// Creates a [`Self::FeatureNameTable`].
+    fn feature_name_table() -> Self {
+        use {AutoclearFeatures as A, CompatibleFeatures as C, IncompatibleFeatures as I};
+
+        let mut map = HashMap::new();
+
+        map.insert(I::Dirty.into(), "dirty".into());
+        map.insert(I::Corrupt.into(), "corrupt".into());
+        map.insert(I::ExternalDataFile.into(), "external data file".into());
+        map.insert(
+            I::CompressionType.into(),
+            "extended compression type".into(),
+        );
+        map.insert(I::ExtendedL2Entries.into(), "extended L2 entries".into());
+
+        map.insert(C::LazyRefcounts.into(), "lazy refcounts".into());
+
+        map.insert(A::Bitmaps.into(), "persistent dirty bitmaps".into());
+        map.insert(A::RawExternalData.into(), "raw external data file".into());
+
+        HeaderExtension::FeatureNameTable(map)
+    }
 }
 
 /// L1 table entry.
@@ -918,8 +1157,7 @@ impl TableEntry for L1Entry {
 
         if entry.reserved_bits() != 0 {
             return Err(invalid_data(format!(
-                "Invalid L1 entry 0x{:x}, reserved bits set (0x{:x})",
-                value,
+                "Invalid L1 entry 0x{value:x}, reserved bits set (0x{:x})",
                 entry.reserved_bits(),
             )));
         }
@@ -927,9 +1165,7 @@ impl TableEntry for L1Entry {
         if let Some(l2_ofs) = entry.l2_offset() {
             if l2_ofs.in_cluster_offset(header.cluster_bits()) != 0 {
                 return Err(invalid_data(format!(
-                    "Invalid L1 entry 0x{:x}, offset ({}) is not aligned to cluster size (0x{:x})",
-                    value,
-                    l2_ofs,
+                    "Invalid L1 entry 0x{value:x}, offset ({l2_ofs}) is not aligned to cluster size (0x{:x})",
                     header.cluster_size(),
                 )));
             }
@@ -1376,8 +1612,7 @@ impl TableEntry for AtomicL2Entry {
 
         if entry.reserved_bits() != 0 {
             return Err(invalid_data(format!(
-                "Invalid L2 entry 0x{:x}, reserved bits set (0x{:x})",
-                value,
+                "Invalid L2 entry 0x{value:x}, reserved bits set (0x{:x})",
                 entry.reserved_bits(),
             )));
         }
@@ -1385,9 +1620,7 @@ impl TableEntry for AtomicL2Entry {
         if let Some(offset) = entry.cluster_offset(header.external_data_file()) {
             if !entry.is_compressed() && offset.in_cluster_offset(header.cluster_bits()) != 0 {
                 return Err(invalid_data(format!(
-                    "Invalid L2 entry 0x{:x}, offset ({}) is not aligned to cluster size (0x{:x})",
-                    value,
-                    offset,
+                    "Invalid L2 entry 0x{value:x}, offset ({offset}) is not aligned to cluster size (0x{:x})",
                     header.cluster_size(),
                 )));
             }
@@ -1553,7 +1786,7 @@ impl L2TableWriteGuard<'_> {
     ///
     /// If the allocation is reused, `None` is returned, so this function only returns `Some(_)` if
     /// some cluster is indeed leaked.
-    #[must_use]
+    #[must_use = "Leaked allocation must be freed"]
     pub fn map_cluster(
         &mut self,
         index: usize,
@@ -1581,6 +1814,93 @@ impl L2TableWriteGuard<'_> {
         } else {
             None
         }
+    }
+
+    /// Make the given index a zero mapping.
+    ///
+    /// If `keep_allocation` is true, keep the zero cluster pre-allocated if there is a
+    /// pre-existing single-cluster allocation (i.e. data cluster or pre-allocated zero cluster).
+    /// Otherwise, the existing mapping is discarded.
+    ///
+    /// If a previous mapping is discarded, return the old allocation so its refcount can be
+    /// decreased (offset of the first cluster and number of clusters -- compressed clusters can
+    /// span across host cluster boundaries).
+    #[must_use = "Leaked allocation must be freed"]
+    pub fn zero_cluster(
+        &mut self,
+        index: usize,
+        keep_allocation: bool,
+    ) -> io::Result<Option<(HostCluster, ClusterCount)>> {
+        let cluster_copied = if keep_allocation {
+            match self.table.data[index].get().into_mapping(
+                GuestCluster(0), // only used for backing, which we ignore
+                self.table.cluster_bits,
+                self.table.external_data_file,
+            )? {
+                L2Mapping::DataFile {
+                    host_cluster,
+                    copied,
+                } => Some((host_cluster, copied)),
+                L2Mapping::Backing { backing_offset: _ } => None,
+                L2Mapping::Zero {
+                    host_cluster: Some(host_cluster),
+                    copied,
+                } => Some((host_cluster, copied)),
+                L2Mapping::Zero {
+                    host_cluster: None,
+                    copied: _,
+                } => None,
+                L2Mapping::Compressed {
+                    host_offset: _,
+                    length: _,
+                } => None,
+            }
+        } else {
+            None
+        };
+
+        let retained = cluster_copied.is_some();
+        let new = if let Some((cluster, copied)) = cluster_copied {
+            L2Mapping::Zero {
+                host_cluster: Some(cluster),
+                copied,
+            }
+        } else {
+            L2Mapping::Zero {
+                host_cluster: None,
+                copied: false,
+            }
+        };
+        let new = L2Entry::from_mapping(new, self.table.cluster_bits);
+
+        // Safe: We set a full valid mapping, and there is only one writer (thanks to
+        // `L2TableWriteGuard`).
+        let old = unsafe { self.table.data[index].swap(new) };
+        self.table.modified.store(true, Ordering::Relaxed);
+
+        let leaked = if !retained {
+            old.allocation(self.table.cluster_bits, self.table.external_data_file)
+        } else {
+            None
+        };
+        Ok(leaked)
+    }
+
+    /// Remove the given mapping, leaving it empty.
+    ///
+    /// If a previous mapping is discarded, return the old allocation so its refcount can be
+    /// decreased (offset of the first cluster and number of clusters -- compressed clusters can
+    /// span across host cluster boundaries).
+    #[must_use = "Leaked allocation must be freed"]
+    pub fn discard_cluster(&mut self, index: usize) -> Option<(HostCluster, ClusterCount)> {
+        let new = L2Entry(0);
+
+        // Safe: We set a full valid mapping, and there is only one writer (thanks to
+        // `L2TableWriteGuard`).
+        let old = unsafe { self.table.data[index].swap(new) };
+        self.table.modified.store(true, Ordering::Relaxed);
+
+        old.allocation(self.table.cluster_bits, self.table.external_data_file)
     }
 }
 
@@ -1709,8 +2029,7 @@ impl TableEntry for RefTableEntry {
 
         if entry.reserved_bits() != 0 {
             return Err(invalid_data(format!(
-                "Invalid reftable entry 0x{:x}, reserved bits set (0x{:x})",
-                value,
+                "Invalid reftable entry 0x{value:x}, reserved bits set (0x{:x})",
                 entry.reserved_bits(),
             )));
         }
@@ -1719,9 +2038,7 @@ impl TableEntry for RefTableEntry {
             if rb_ofs.in_cluster_offset(header.cluster_bits()) != 0 {
                 return Err(invalid_data(
                     format!(
-                        "Invalid reftable entry 0x{:x}, offset ({}) is not aligned to cluster size (0x{:x})",
-                        value,
-                        rb_ofs,
+                        "Invalid reftable entry 0x{value:x}, offset ({rb_ofs}) is not aligned to cluster size (0x{:x})",
                         header.cluster_size(),
                     ),
                 ));
@@ -2521,7 +2838,7 @@ fn check_table(
         )));
     }
 
-    if offset % (cluster_size as u64) != 0 {
+    if !offset.is_multiple_of(cluster_size as u64) {
         return Err(invalid_data(format!("{name}: Unaligned offset: {offset}")));
     }
 
@@ -2538,4 +2855,34 @@ fn check_table(
     }
 
     Ok(())
+}
+
+/// Helper function replacing `bincode::serialized_size()`.
+///
+/// This function has not yet been implemented in bincode 2.
+fn encoded_size<E: Encode>(val: E) -> io::Result<usize> {
+    let mut length = bincode::enc::write::SizeWriter::default();
+    bincode::encode_into_writer(val, &mut length, BINCODE_CFG)
+        .map_err(|err| invalid_data(err.to_string()))?;
+    Ok(length.bytes_written)
+}
+
+/// Helper function replacing `bincode::encode_to_vec()`.
+///
+/// Bincode provides an `encode_to_vec()` function, but only under the `alloc` feature.  For some
+/// reason, enabling that feature pulls in a serde dependency, so re-implement it here.
+fn encode_binary<E: Encode>(val: &E) -> io::Result<Vec<u8>> {
+    let mut vec = vec![0; encoded_size(val)?];
+    bincode::encode_into_slice(val, &mut vec, BINCODE_CFG)
+        .map_err(|err| invalid_data(err.to_string()))?;
+    Ok(vec)
+}
+
+/// Helper function wrapping `bincode::decode_from_slice()`.
+///
+/// We already have [`encode_binary()`] as a helper, we might as well have a helper for decoding.
+fn decode_binary<D: Decode<()>>(slice: &[u8]) -> io::Result<D> {
+    bincode::decode_from_slice(slice, BINCODE_CFG)
+        .map(|(result, _)| result)
+        .map_err(|err| invalid_data(err.to_string()))
 }

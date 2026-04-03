@@ -177,6 +177,15 @@ impl<S: Storage> Allocator<S> {
         self.rb_cache.flush().await
     }
 
+    /// Invaidate the refcount block cache.
+    ///
+    /// # Safety
+    /// May cause image corruption, you must guarantee the on-disk state is consistent.
+    pub async unsafe fn invalidate_rb_cache(&self) -> io::Result<()> {
+        // Safe: Caller says so.
+        unsafe { self.rb_cache.invalidate() }.await
+    }
+
     /// Allocate clusters in the image file.
     ///
     /// `end_cluster` should only be used when allocating refblocks.  When reaching this cluster

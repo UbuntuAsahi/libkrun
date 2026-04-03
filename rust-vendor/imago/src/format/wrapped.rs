@@ -20,11 +20,11 @@ pub trait WrappedFormat<S: Storage>: Debug + Display + Send + Sync {
     fn wrap(inner: FormatAccess<S>) -> Self;
 
     /// Access the inner format instance.
-    fn unwrap(&self) -> &FormatAccess<S>;
+    fn inner(&self) -> &FormatAccess<S>;
 }
 
 impl<
-        S: Storage,
+        S: Storage + 'static,
         D: Deref<Target = FormatAccess<S>> + Debug + Display + From<FormatAccess<S>> + Send + Sync,
     > WrappedFormat<S> for D
 {
@@ -32,7 +32,7 @@ impl<
         Self::from(inner)
     }
 
-    fn unwrap(&self) -> &FormatAccess<S> {
+    fn inner(&self) -> &FormatAccess<S> {
         self.deref()
     }
 }
@@ -42,7 +42,7 @@ impl<S: Storage> WrappedFormat<S> for FormatAccess<S> {
         inner
     }
 
-    fn unwrap(&self) -> &FormatAccess<S> {
+    fn inner(&self) -> &FormatAccess<S> {
         self
     }
 }
@@ -53,7 +53,7 @@ impl<S: Storage> WrappedFormat<S> for OwnedRwLockReadGuard<FormatAccess<S>> {
         Arc::new(RwLock::new(inner)).try_read_owned().unwrap()
     }
 
-    fn unwrap(&self) -> &FormatAccess<S> {
+    fn inner(&self) -> &FormatAccess<S> {
         self.deref()
     }
 }

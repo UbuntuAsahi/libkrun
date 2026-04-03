@@ -3,9 +3,13 @@
 #[cfg(unix)]
 use crate::io_buffers::IoBuffer;
 use crate::io_buffers::{IoVector, IoVectorMut};
+#[cfg(unix)]
+use crate::misc_helpers::while_eintr;
 use crate::misc_helpers::ResultErrorContext;
 use crate::storage::drivers::CommonStorageHelper;
-use crate::{Storage, StorageOpenOptions};
+use crate::storage::ext::write_full_zeroes;
+use crate::storage::PreallocateMode;
+use crate::{Storage, StorageCreateOptions, StorageOpenOptions};
 use cfg_if::cfg_if;
 use std::fmt::{self, Display, Formatter};
 use std::io::{self, Write};
@@ -45,6 +49,12 @@ pub struct File {
     /// Minimal memory buffer alignment.
     mem_align: usize,
 
+    /// Minimum required alignment for zero writes.
+    zero_align: usize,
+
+    /// Minimum required alignment for effective discards.
+    discard_align: usize,
+
     /// Cached file length.
     ///
     /// Third parties changing the length concurrently is pretty certain to break things anyway.
@@ -52,6 +62,10 @@ pub struct File {
 
     /// Storage helper.
     common_storage_helper: CommonStorageHelper,
+
+    /// macOS-only: Use fsync() instead of F_FULLFSYNC on `sync()` method.
+    #[cfg(target_os = "macos")]
+    relaxed_sync: bool,
 }
 
 impl TryFrom<fs::File> for File {
@@ -64,18 +78,47 @@ impl TryFrom<fs::File> for File {
     /// When using this, the resulting object will not know its own filename.  That makes it
     /// impossible to auto-resolve relative paths to it, e.g. qcow2 backing file names.
     fn try_from(file: fs::File) -> io::Result<Self> {
-        Self::new(file, None, false)
+        Self::new(
+            file,
+            None,
+            false,
+            #[cfg(target_os = "macos")]
+            false,
+        )
     }
 }
 
 impl Storage for File {
     async fn open(opts: StorageOpenOptions) -> io::Result<Self> {
-        Self::do_open_sync(opts)
+        Self::do_open_sync(opts, fs::OpenOptions::new())
     }
 
     #[cfg(feature = "sync-wrappers")]
     fn open_sync(opts: StorageOpenOptions) -> io::Result<Self> {
-        Self::do_open_sync(opts)
+        Self::do_open_sync(opts, fs::OpenOptions::new())
+    }
+
+    async fn create_open(opts: StorageCreateOptions) -> io::Result<Self> {
+        // Always allow writing for new files
+        let opts = opts.modify_open_opts(|o| o.write(true));
+        let size = opts.size;
+        let prealloc_mode = opts.prealloc_mode;
+
+        let mut file_opts = fs::OpenOptions::new();
+        if opts.overwrite {
+            file_opts.create(true).truncate(true);
+        } else {
+            file_opts.create_new(true);
+        };
+
+        let file = Self::do_open_sync(opts.get_open_options(), file_opts)?;
+        if size > 0 {
+            file.resize(size, prealloc_mode)
+                .await
+                .err_context(|| "Resizing file")?;
+        }
+
+        Ok(file)
     }
 
     fn mem_align(&self) -> usize {
@@ -84,6 +127,14 @@ impl Storage for File {
 
     fn req_align(&self) -> usize {
         self.req_align
+    }
+
+    fn zero_align(&self) -> usize {
+        self.zero_align
+    }
+
+    fn discard_align(&self) -> usize {
+        self.discard_align
     }
 
     fn size(&self) -> io::Result<u64> {
@@ -109,6 +160,10 @@ impl Storage for File {
         Ok(dirname.join(relative))
     }
 
+    fn get_filename(&self) -> Option<PathBuf> {
+        self.filename.as_ref().cloned()
+    }
+
     #[cfg(unix)]
     async unsafe fn pure_readv(
         &self,
@@ -117,26 +172,18 @@ impl Storage for File {
     ) -> io::Result<()> {
         while !bufv.is_empty() {
             let iovec = unsafe { bufv.as_iovec() };
-            let result = unsafe {
+            let preadv_offset = offset
+                .try_into()
+                .map_err(|_| io::Error::other("Read offset overflow"))?;
+
+            let len = while_eintr(|| unsafe {
                 libc::preadv(
                     self.file.read().unwrap().as_raw_fd(),
                     iovec.as_ptr(),
                     iovec.len() as libc::c_int,
-                    offset
-                        .try_into()
-                        .map_err(|_| io::Error::other("Read offset overflow"))?,
+                    preadv_offset,
                 )
-            };
-
-            let len = if result < 0 {
-                let err = io::Error::last_os_error();
-                if err.raw_os_error() == Some(libc::EINTR) {
-                    continue;
-                }
-                return Err(err);
-            } else {
-                result as u64
-            };
+            })? as u64;
 
             if len == 0 {
                 // End of file
@@ -177,28 +224,20 @@ impl Storage for File {
     async unsafe fn pure_writev(&self, mut bufv: IoVector<'_>, mut offset: u64) -> io::Result<()> {
         while !bufv.is_empty() {
             let iovec = unsafe { bufv.as_iovec() };
-            let result = unsafe {
+            let pwritev_offset = offset
+                .try_into()
+                .map_err(|_| io::Error::other("Write offset overflow"))?;
+
+            let len = while_eintr(|| unsafe {
                 libc::pwritev(
                     self.file.read().unwrap().as_raw_fd(),
                     iovec.as_ptr(),
                     iovec.len() as libc::c_int,
-                    offset
-                        .try_into()
-                        .map_err(|_| io::Error::other("Write offset overflow"))?,
+                    pwritev_offset,
                 )
-            };
+            })? as u64;
 
-            let len = if result < 0 {
-                let err = io::Error::last_os_error();
-                if err.raw_os_error() == Some(libc::EINTR) {
-                    continue;
-                }
-                return Err(err);
-            } else {
-                result as u64
-            };
-
-            if result == 0 {
+            if len == 0 {
                 // Should not happen, i.e. is an error
                 return Err(io::ErrorKind::WriteZero.into());
             }
@@ -235,6 +274,24 @@ impl Storage for File {
         unsafe { self.pure_discard(offset, length) }.await
     }
 
+    #[cfg(target_os = "linux")]
+    async unsafe fn pure_write_allocated_zeroes(&self, offset: u64, length: u64) -> io::Result<()> {
+        let offset: libc::off_t = offset
+            .try_into()
+            .map_err(|e| io::Error::other(format!("Discard/write-zeroes offset error: {e}")))?;
+        let length: libc::off_t = length
+            .try_into()
+            .map_err(|e| io::Error::other(format!("Discard/write-zeroes length error: {e}")))?;
+
+        let file = self.file.read().unwrap();
+        // Safe: File descriptor is valid, and the rest are simple integer parameters.
+        while_eintr(|| unsafe {
+            libc::fallocate(file.as_raw_fd(), libc::FALLOC_FL_ZERO_RANGE, offset, length)
+        })?;
+
+        Ok(())
+    }
+
     // Beware when adding new discard methods: This is called by `pure_write_zeroes()`, so the
     // current expectation is that discarded ranges will read back as zeroes.  If the new method
     // does not guarantee that, you will need to modify `pure_write_zeroes()`.
@@ -244,27 +301,23 @@ impl Storage for File {
             return Ok(());
         }
 
-        // If offset or length are too big, just skip discarding.
-        let Ok(offset) = libc::off_t::try_from(offset) else {
-            return Ok(());
-        };
-        let Ok(length) = libc::off_t::try_from(length) else {
-            return Ok(());
-        };
+        let offset: libc::off_t = offset
+            .try_into()
+            .map_err(|e| io::Error::other(format!("Discard/write-zeroes offset error: {e}")))?;
+        let length: libc::off_t = length
+            .try_into()
+            .map_err(|e| io::Error::other(format!("Discard/write-zeroes length error: {e}")))?;
 
         let file = self.file.read().unwrap();
         // Safe: File descriptor is valid, and the rest are simple integer parameters.
-        let ret = unsafe {
+        while_eintr(|| unsafe {
             libc::fallocate(
                 file.as_raw_fd(),
                 libc::FALLOC_FL_PUNCH_HOLE | libc::FALLOC_FL_KEEP_SIZE,
                 offset,
                 length,
             )
-        };
-        if ret < 0 {
-            return Err(io::Error::last_os_error());
-        }
+        })?;
 
         Ok(())
     }
@@ -278,13 +331,12 @@ impl Storage for File {
             return Ok(());
         }
 
-        // If offset or length are too big, just skip discarding.
-        let Ok(offset) = i64::try_from(offset) else {
-            return Ok(());
-        };
-        let Ok(length) = i64::try_from(length) else {
-            return Ok(());
-        };
+        let offset: i64 = offset
+            .try_into()
+            .map_err(|e| io::Error::other(format!("Discard/write-zeroes offset error: {e}")))?;
+        let length: i64 = length
+            .try_into()
+            .map_err(|e| io::Error::other(format!("Discard/write-zeroes length error: {e}")))?;
 
         let end = offset.saturating_add(length).saturating_add(1);
         let params = FILE_ZERO_DATA_INFORMATION {
@@ -324,13 +376,12 @@ impl Storage for File {
             return Ok(());
         }
 
-        // If offset or length are too big, just skip discarding.
-        let Ok(offset) = libc::off_t::try_from(offset) else {
-            return Ok(());
-        };
-        let Ok(length) = libc::off_t::try_from(length) else {
-            return Ok(());
-        };
+        let offset: libc::off_t = offset
+            .try_into()
+            .map_err(|e| io::Error::other(format!("Discard/write-zeroes offset error: {e}")))?;
+        let length: libc::off_t = length
+            .try_into()
+            .map_err(|e| io::Error::other(format!("Discard/write-zeroes length error: {e}")))?;
 
         let params = libc::fpunchhole_t {
             fp_flags: 0,
@@ -340,10 +391,7 @@ impl Storage for File {
         };
         let file = self.file.read().unwrap();
         // Safe: FD is valid, passed pointer is valid and its type matches the call.
-        let ret = unsafe { libc::fcntl(file.as_raw_fd(), libc::F_PUNCHHOLE, &params) };
-        if ret < 0 {
-            return Err(io::Error::last_os_error());
-        }
+        while_eintr(|| unsafe { libc::fcntl(file.as_raw_fd(), libc::F_PUNCHHOLE, &params) })?;
 
         Ok(())
     }
@@ -353,11 +401,89 @@ impl Storage for File {
     }
 
     async fn sync(&self) -> io::Result<()> {
+        #[cfg(target_os = "macos")]
+        if self.relaxed_sync {
+            // Safe: File descriptor is valid and there aren't any other arguments.
+            while_eintr(|| unsafe { libc::fsync(self.file.write().unwrap().as_raw_fd()) })?;
+            return Ok(());
+        }
         self.file.write().unwrap().sync_all()
+    }
+
+    async unsafe fn invalidate_cache(&self) -> io::Result<()> {
+        // TODO: Figure out what to do.  Generally, `std::fs::File` does not have internal buffers,
+        // so we don’t need to invalidate anything; we could close and reopen, but that would still
+        // flush, and is difficult to do in a platform-independent way (/proc/self/fd would allow
+        // this on Linux).  Using e.g. the filename is not safe.
+        // Right now, it’s best not to do anything.
+        Ok(())
     }
 
     fn get_storage_helper(&self) -> &CommonStorageHelper {
         &self.common_storage_helper
+    }
+
+    async fn resize(&self, new_size: u64, prealloc_mode: PreallocateMode) -> io::Result<()> {
+        let file = self.file.write().unwrap();
+        let current_size = self.size.load(Ordering::Relaxed);
+
+        match new_size.cmp(&current_size) {
+            std::cmp::Ordering::Equal => return Ok(()),
+            std::cmp::Ordering::Less => {
+                file.set_len(new_size)?;
+                self.size.fetch_min(new_size, Ordering::Relaxed);
+                return Ok(());
+            }
+            std::cmp::Ordering::Greater => (), // handled below
+        }
+
+        match prealloc_mode {
+            PreallocateMode::None | PreallocateMode::Zero => file.set_len(new_size)?,
+            PreallocateMode::Allocate => {
+                #[cfg(not(unix))]
+                return Err(io::ErrorKind::Unsupported.into());
+
+                #[cfg(all(unix, not(target_os = "macos")))]
+                {
+                    let ofs = current_size.try_into().map_err(io::Error::other)?;
+                    let len = (new_size - current_size)
+                        .try_into()
+                        .map_err(io::Error::other)?;
+                    while_eintr(|| unsafe { libc::fallocate(file.as_raw_fd(), 0, ofs, len) })?;
+                }
+
+                #[cfg(target_os = "macos")]
+                {
+                    // Best-effort.  PEOFPOSMODE allocates from the “physical” EOF, wherever that
+                    // may be, but the only alternative would be VOLPOSMODE, which nobody knows the
+                    // meaning of.  Also doesn’t change the file length, we need to truncate
+                    // afterwards still.
+                    let mut params = libc::fstore_t {
+                        fst_flags: libc::F_ALLOCATEALL,
+                        fst_posmode: libc::F_PEOFPOSMODE,
+                        fst_offset: 0,
+                        fst_length: (new_size - current_size)
+                            .try_into()
+                            .map_err(io::Error::other)?,
+                        fst_bytesalloc: 0, // output
+                    };
+                    while_eintr(|| unsafe {
+                        libc::fcntl(file.as_raw_fd(), libc::F_PREALLOCATE, &mut params)
+                    })?;
+
+                    file.set_len(new_size)?;
+                }
+            }
+            PreallocateMode::WriteData => {
+                // FIXME: Keeping the lock would be nice, but resizing concurrently with I/O is
+                // pretty risky anyway.
+                drop(file);
+                write_full_zeroes(self, current_size, new_size - current_size).await?;
+            }
+        }
+
+        self.size.fetch_max(new_size, Ordering::Relaxed);
+        Ok(())
     }
 }
 
@@ -366,7 +492,12 @@ impl File {
     ///
     /// `direct_io` should be `true` if direct I/O was requested, and can be `false` if that status
     /// is unknown.
-    fn new(mut file: fs::File, filename: Option<PathBuf>, direct_io: bool) -> io::Result<Self> {
+    fn new(
+        mut file: fs::File,
+        filename: Option<PathBuf>,
+        direct_io: bool,
+        #[cfg(target_os = "macos")] relaxed_sync: bool,
+    ) -> io::Result<Self> {
         let size = get_file_size(&file).err_context(|| "Failed to determine file size")?;
 
         #[cfg(all(unix, not(target_os = "macos")))]
@@ -393,7 +524,7 @@ impl File {
             (1, 1)
         };
 
-        let (req_align, mem_align) =
+        let (req_align, mem_align, zero_align, discard_align) =
             Self::probe_alignments(&mut file, min_req_align, min_mem_align);
         assert!(req_align.is_power_of_two());
         assert!(mem_align.is_power_of_two());
@@ -403,12 +534,16 @@ impl File {
             filename,
             req_align,
             mem_align,
+            zero_align,
+            discard_align,
             size: size.into(),
             common_storage_helper: Default::default(),
+            #[cfg(target_os = "macos")]
+            relaxed_sync,
         })
     }
 
-    /// Probe minimal request and memory alignments.
+    /// Probe minimal request, memory, zero and discard alignments.
     ///
     /// Start at `min_req_align` and `min_mem_align`.
     #[cfg(unix)]
@@ -416,7 +551,7 @@ impl File {
         file: &mut fs::File,
         min_req_align: usize,
         min_mem_align: usize,
-    ) -> (usize, usize) {
+    ) -> (usize, usize, usize, usize) {
         let mut page_size = page_size::get();
         if !page_size.is_power_of_two() {
             let assume = page_size.checked_next_power_of_two().unwrap_or(4096);
@@ -424,6 +559,18 @@ impl File {
             warn!("Reported page size of {page_size} is not a power of two, assuming {assume}");
             page_size = assume;
         }
+
+        #[cfg(not(target_os = "macos"))]
+        let (zero_align, discard_align) = (1, 1);
+        #[cfg(target_os = "macos")]
+        let (zero_align, discard_align) = {
+            let mut statfs: libc::statfs = unsafe { std::mem::zeroed() };
+            // Safe: FD is valid, passed pointer is valid and its type matches the call.
+            match while_eintr(|| unsafe { libc::fstatfs(file.as_raw_fd(), &mut statfs) }) {
+                Ok(_) => (statfs.f_bsize as usize, statfs.f_bsize as usize),
+                Err(_) => (page_size, page_size),
+            }
+        };
 
         let mut writable = true;
 
@@ -441,7 +588,7 @@ impl File {
                     "Failed to allocate memory to probe request alignment ({err}), \
                     falling back to {safe_req_align}/{safe_mem_align}"
                 );
-                return (safe_req_align, safe_mem_align);
+                return (safe_req_align, safe_mem_align, zero_align, discard_align);
             }
         };
 
@@ -481,10 +628,8 @@ impl File {
                 // Failed to determine request alignment, use a presumably safe value
                 let align = cmp::max(req_align, safe_req_align);
                 warn!(
-                    "Failed to probe request alignment ({}; {}), falling back to {} bytes",
-                    err,
+                    "Failed to probe request alignment ({err}; {}), falling back to {align} bytes",
                     err.kind(),
-                    align
                 );
                 align
             }
@@ -528,16 +673,14 @@ impl File {
                 // Failed to determine memory alignment, use a presumably safe value
                 let align = cmp::max(mem_align, safe_mem_align);
                 warn!(
-                    "Failed to probe memory alignment ({}; {}), falling back to {} bytes",
-                    err,
+                    "Failed to probe memory alignment ({err}; {}), falling back to {align} bytes",
                     err.kind(),
-                    align
                 );
                 align
             }
         };
 
-        (req_align, mem_align)
+        (req_align, mem_align, zero_align, discard_align)
     }
 
     /// Do an alignment-probing I/O access.
@@ -557,17 +700,16 @@ impl File {
     ) -> io::Result<bool> {
         // Use `libc::pread` so we get well-defined errors.
         // Safe: Passing the slice as the buffer it is.
-        let ret = unsafe {
+        let ret = while_eintr(|| unsafe {
             libc::pread(
                 file.as_raw_fd(),
                 slice.as_mut_ptr() as *mut libc::c_void,
                 slice.len(),
                 offset,
             )
-        };
+        });
 
-        if ret < 0 {
-            let err = io::Error::last_os_error();
+        if let Err(err) = ret {
             if err.raw_os_error() == Some(libc::EINVAL) {
                 return Ok(false);
             } else {
@@ -580,17 +722,16 @@ impl File {
         }
 
         // Safe: Passing the slice as the buffer it is.
-        let ret = unsafe {
+        let ret = while_eintr(|| unsafe {
             libc::pwrite(
                 file.as_raw_fd(),
                 slice.as_ptr() as *const libc::c_void,
                 slice.len(),
                 offset,
             )
-        };
+        });
 
-        if ret < 0 {
-            let err = io::Error::last_os_error();
+        if let Err(err) = ret {
             if err.raw_os_error() == Some(libc::EINVAL) {
                 Ok(false)
             } else if err.raw_os_error() == Some(libc::EBADF) {
@@ -656,18 +797,26 @@ impl File {
         _file: &mut fs::File,
         min_req_align: usize,
         min_mem_align: usize,
-    ) -> (usize, usize) {
+    ) -> (usize, usize, usize, usize) {
         // TODO: Need to find out how Windows indicates unaligned I/O
-        (cmp::max(min_req_align, 4096), cmp::max(min_mem_align, 4096))
+        (
+            cmp::max(min_req_align, 4096),
+            cmp::max(min_mem_align, 4096),
+            1,
+            1,
+        )
     }
 
-    /// Implementation for [`File::open()`] and [`File::open_sync()`].
-    fn do_open_sync(opts: StorageOpenOptions) -> io::Result<Self> {
+    /// Implementation for anything that opens a file.
+    fn do_open_sync(opts: StorageOpenOptions, base_fs_opts: fs::OpenOptions) -> io::Result<Self> {
         let Some(filename) = opts.filename else {
-            return Err(io::Error::other("Filename required"));
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "Filename required",
+            ));
         };
 
-        let mut file_opts = fs::OpenOptions::new();
+        let mut file_opts = base_fs_opts;
         file_opts.read(true).write(opts.writable);
         #[cfg(not(target_os = "macos"))]
         if opts.direct {
@@ -685,17 +834,17 @@ impl File {
         #[cfg(target_os = "macos")]
         if opts.direct {
             // Safe: We check the return value.
-            let ret = unsafe { libc::fcntl(file.as_raw_fd(), libc::F_NOCACHE, 1) };
-            if ret < 0 {
-                let err = io::Error::last_os_error();
-                return Err(io::Error::new(
-                    err.kind(),
-                    format!("Failed to disable host cache: {err}"),
-                ));
-            }
+            while_eintr(|| unsafe { libc::fcntl(file.as_raw_fd(), libc::F_NOCACHE, 1) })
+                .err_context(|| "Failed to disable host cache")?;
         }
 
-        Self::new(file, Some(filename_owned), opts.direct)
+        Self::new(
+            file,
+            Some(filename_owned),
+            opts.direct,
+            #[cfg(target_os = "macos")]
+            opts.relaxed_sync,
+        )
     }
 
     /// Attempt to discard range by truncating the file.

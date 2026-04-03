@@ -1,10 +1,8 @@
 --- a/Makefile
 +++ b/Makefile
-@@ -157,7 +157,3 @@
- 	rm -rf test-prefix
- 	cd tests; $(CARGO) clean
+@@ -241,5 +241,3 @@
+ TEST ?= all
+ TEST_FLAGS ?=
  
--test: $(LIBRARY_RELEASE_$(OS))
--	mkdir -p test-prefix
--	PREFIX="$$(realpath test-prefix)" make install
--	cd tests; LD_LIBRARY_PATH="$$(realpath ../test-prefix/lib64/)" PKG_CONFIG_PATH="$$(realpath ../test-prefix/lib64/pkgconfig/)" ./run.sh
+-test: test-prefix
+-	cd tests; RUST_LOG=trace LD_LIBRARY_PATH="$$(realpath ../test-prefix/lib64/)" PKG_CONFIG_PATH="$$(realpath ../test-prefix/lib64/pkgconfig/)" ./run.sh test --test-case "$(TEST)" $(TEST_FLAGS)

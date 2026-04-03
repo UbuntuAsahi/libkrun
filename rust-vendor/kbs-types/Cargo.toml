@@ -12,7 +12,7 @@
 [package]
 edition = "2021"
 name = "kbs-types"
-version = "0.11.0"
+version = "0.13.0"
 authors = ["Sergio Lopez <slp@redhat.com>"]
 build = false
 autolib = false
@@ -38,8 +38,6 @@ std = [
     "serde_json/std",
     "thiserror/std",
 ]
-tee-sev = ["sev"]
-tee-snp = ["sev"]
 
 [lib]
 name = "kbs_types"
@@ -58,10 +56,15 @@ default-features = false
 version = "1.0"
 default-features = false
 
-[dependencies.sev]
-version = "6.0.0"
-features = ["openssl"]
-optional = true
+[dependencies.sha2]
+version = "0.10"
+
+[dependencies.sm3]
+version = "0.4.2"
+
+[dependencies.strum]
+version = "0.27"
+features = ["derive"]
 
 [dependencies.thiserror]
 version = "2.0.3"

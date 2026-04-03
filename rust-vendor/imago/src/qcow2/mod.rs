@@ -1,26 +1,33 @@
 //! Qcow2 implementation.
 
 mod allocation;
+mod builder;
 mod cache;
 mod compressed;
 mod cow;
 mod io_func;
 mod mappings;
 mod metadata;
+mod preallocation;
 #[cfg(feature = "sync-wrappers")]
 mod sync_wrappers;
 mod types;
 
 use crate::async_lru_cache::AsyncLruCache;
-use crate::format::drivers::{FormatDriverInstance, Mapping};
+use crate::format::builder::{FormatCreateBuilder, FormatDriverBuilder};
+use crate::format::drivers::FormatDriverInstance;
+use crate::format::gate::{ImplicitOpenGate, PermissiveImplicitOpenGate};
 use crate::format::wrapped::WrappedFormat;
+use crate::format::{Format, PreallocateMode};
 use crate::io_buffers::IoVectorMut;
 use crate::misc_helpers::{invalid_data, ResultErrorContext};
 use crate::raw::Raw;
-use crate::{FormatAccess, Storage, StorageExt, StorageOpenOptions};
+use crate::{storage, FormatAccess, ShallowMapping, Storage, StorageExt, StorageOpenOptions};
 use allocation::Allocator;
 use async_trait::async_trait;
+pub use builder::{Qcow2CreateBuilder, Qcow2OpenBuilder};
 use cache::L2CacheBackend;
+use mappings::FixedMapping;
 use metadata::*;
 use std::fmt::{self, Debug, Display, Formatter};
 use std::ops::Range;
@@ -52,6 +59,8 @@ pub struct Qcow2<S: Storage + 'static, F: WrappedFormat<S> + 'static = FormatAcc
     backing_set: bool,
     /// Backing image.
     backing: Option<F>,
+    /// Base options to be used for implicitly opened storage objects.
+    storage_open_options: StorageOpenOptions,
 
     /// Qcow2 header.
     header: Arc<Header>,
@@ -68,19 +77,29 @@ pub struct Qcow2<S: Storage + 'static, F: WrappedFormat<S> + 'static = FormatAcc
 }
 
 impl<S: Storage + 'static, F: WrappedFormat<S> + 'static> Qcow2<S, F> {
-    /// Opens a qcow2 file.
+    /// Create a new [`FormatDriverBuilder`] instance for the given image.
+    pub fn builder(image: S) -> Qcow2OpenBuilder<S, F> {
+        Qcow2OpenBuilder::new(image)
+    }
+
+    /// Create a new [`FormatDriverBuilder`] instance for an image under the given path.
+    pub fn builder_path<P: AsRef<Path>>(image_path: P) -> Qcow2OpenBuilder<S, F> {
+        Qcow2OpenBuilder::new_path(image_path)
+    }
+
+    /// Create a new [`FormatCreateBuilder`] instance to format the given file.
+    pub fn create_builder(image: S) -> Qcow2CreateBuilder<S, F> {
+        Qcow2CreateBuilder::<S, F>::new(image)
+    }
+
+    /// Internal implementation for opening a qcow2 image.
     ///
-    /// `metadata` is the file containing the qcow2 metadata.  If `writable` is not set, no
-    /// modifications are permitted.
-    ///
-    /// This will not open any other storage objects needed, i.e. no backing image, no external
-    /// data file.  If you want to handle those manually, check whether an external data file is
-    /// needed via [`Qcow2::requires_external_data_file()`], and, if necessary, assign one via
-    /// [`Qcow2::set_data_file()`]; and assign a backing image via [`Qcow2::set_backing()`].
-    ///
-    /// If you want to use the implicit references given in the image header, use
-    /// [`Qcow2::open_implicit_dependencies()`].
-    pub async fn open_image(metadata: S, writable: bool) -> io::Result<Self> {
+    /// Does not open external dependencies.
+    async fn do_open(
+        metadata: S,
+        writable: bool,
+        storage_open_options: StorageOpenOptions,
+    ) -> io::Result<Self> {
         let header = Arc::new(Header::load(&metadata, writable).await?);
 
         let cb = header.cluster_bits();
@@ -113,6 +132,7 @@ impl<S: Storage + 'static, F: WrappedFormat<S> + 'static> Qcow2<S, F> {
             storage: None,
             backing_set: false,
             backing: None,
+            storage_open_options,
 
             header,
             l1_table: RwLock::new(l1_table),
@@ -120,6 +140,22 @@ impl<S: Storage + 'static, F: WrappedFormat<S> + 'static> Qcow2<S, F> {
             l2_cache,
             allocator,
         })
+    }
+
+    /// Opens a qcow2 file.
+    ///
+    /// `metadata` is the file containing the qcow2 metadata.  If `writable` is not set, no
+    /// modifications are permitted.
+    ///
+    /// This will not open any other storage objects needed, i.e. no backing image, no external
+    /// data file.  If you want to handle those manually, check whether an external data file is
+    /// needed via [`Qcow2::requires_external_data_file()`], and, if necessary, assign one via
+    /// [`Qcow2::set_data_file()`]; and assign a backing image via [`Qcow2::set_backing()`].
+    ///
+    /// If you want to use the implicit references given in the image header, use
+    /// [`Qcow2::open_implicit_dependencies()`].
+    pub async fn open_image(metadata: S, writable: bool) -> io::Result<Self> {
+        Self::do_open(metadata, writable, StorageOpenOptions::new()).await
     }
 
     /// Open a qcow2 file at the given path.
@@ -137,13 +173,7 @@ impl<S: Storage + 'static, F: WrappedFormat<S> + 'static> Qcow2<S, F> {
     pub async fn open_path<P: AsRef<Path>>(path: P, writable: bool) -> io::Result<Self> {
         let storage_opts = StorageOpenOptions::new().write(writable).filename(path);
         let metadata = S::open(storage_opts).await?;
-        Self::open_image(metadata, writable).await
-    }
-
-    /// Check whether the given image file is a qcow2 file.
-    pub(crate) async fn probe(metadata: &S) -> io::Result<()> {
-        Header::load(metadata, true).await?;
-        Ok(())
+        Self::do_open(metadata, writable, StorageOpenOptions::new()).await
     }
 
     /// Does this qcow2 image require an external data file?
@@ -203,7 +233,10 @@ impl<S: Storage + 'static, F: WrappedFormat<S> + 'static> Qcow2<S, F> {
     }
 
     /// Return the image’s implicit data file (as given in the image header).
-    async fn open_implicit_data_file(&self) -> io::Result<Option<S>> {
+    async fn open_implicit_data_file<G: ImplicitOpenGate<S>>(
+        &self,
+        gate: &mut G,
+    ) -> io::Result<Option<S>> {
         if !self.header.external_data_file() {
             return Ok(None);
         }
@@ -219,31 +252,50 @@ impl<S: Storage + 'static, F: WrappedFormat<S> + 'static> Qcow2<S, F> {
             .resolve_relative_path(filename)
             .err_context(|| format!("Cannot resolve external data file name {filename}"))?;
 
-        let opts = StorageOpenOptions::new()
+        let opts = self
+            .storage_open_options
+            .clone()
             .write(true)
             .filename(absolute.clone());
 
-        Ok(Some(S::open(opts).await.err_context(|| {
-            format!("External data file {absolute:?}")
-        })?))
+        let file = gate
+            .open_storage(opts)
+            .await
+            .err_context(|| format!("External data file {absolute:?}"))?;
+        Ok(Some(file))
     }
 
     /// Wrap `file` in the `Raw` format.  Helper for [`Qcow2::implicit_backing_file()`].
-    async fn open_raw_backing_file(&self, file: S) -> io::Result<F> {
-        let raw = Raw::open_image(file, false).await?;
-        Ok(F::wrap(FormatAccess::new(raw)))
+    async fn open_raw_backing_file<G: ImplicitOpenGate<S>>(
+        &self,
+        file: S,
+        gate: &mut G,
+    ) -> io::Result<F> {
+        let opts = Raw::builder(file).storage_open_options(self.storage_open_options.clone());
+        let raw = gate.open_format(opts).await?;
+        Ok(F::wrap(raw))
     }
 
     /// Wrap `file` in the `Qcow2` format.  Helper for [`Qcow2::implicit_backing_file()`].
-    async fn open_qcow2_backing_file(&self, file: S) -> io::Result<F> {
-        let mut qcow2 = Self::open_image(file, false).await?;
+    async fn open_qcow2_backing_file<G: ImplicitOpenGate<S>>(
+        &self,
+        file: S,
+        gate: &mut G,
+    ) -> io::Result<F> {
+        let opts =
+            Qcow2::<S>::builder(file).storage_open_options(self.storage_open_options.clone());
         // Recursive, so needs to be boxed
-        Box::pin(qcow2.open_implicit_dependencies()).await?;
-        Ok(F::wrap(FormatAccess::new(qcow2)))
+        let qcow2 = Box::pin(gate.open_format(opts)).await?;
+        Ok(F::wrap(qcow2))
     }
 
     /// Return the image’s implicit backing image (as given in the image header).
-    async fn open_implicit_backing_file(&self) -> io::Result<Option<F>> {
+    ///
+    /// Anything opened will be passed through `gate`.
+    async fn open_implicit_backing_file<G: ImplicitOpenGate<S>>(
+        &self,
+        gate: &mut G,
+    ) -> io::Result<Option<F>> {
         let Some(filename) = self.header.backing_filename() else {
             return Ok(None);
         };
@@ -253,24 +305,31 @@ impl<S: Storage + 'static, F: WrappedFormat<S> + 'static> Qcow2<S, F> {
             .resolve_relative_path(filename)
             .err_context(|| format!("Cannot resolve backing file name {filename}"))?;
 
-        let opts = StorageOpenOptions::new().filename(absolute.clone());
-        let file = S::open(opts)
+        let file_opts = self
+            .storage_open_options
+            .clone()
+            .filename(absolute.clone())
+            .write(false);
+
+        let file = gate
+            .open_storage(file_opts)
             .await
             .err_context(|| format!("Backing file {absolute:?}"))?;
 
         let result = match self.header.backing_format().map(|f| f.as_str()) {
-            Some("qcow2") => self.open_qcow2_backing_file(file).await.map(Some),
-            Some("raw") | Some("file") => self.open_raw_backing_file(file).await.map(Some),
+            Some("qcow2") => self.open_qcow2_backing_file(file, gate).await.map(Some),
+            Some("raw") | Some("file") => self.open_raw_backing_file(file, gate).await.map(Some),
 
             Some(fmt) => Err(io::Error::other(format!("Unknown backing format {fmt}"))),
 
-            None => {
-                if Self::probe(&file).await.is_ok() {
-                    self.open_qcow2_backing_file(file).await.map(Some)
-                } else {
-                    self.open_raw_backing_file(file).await.map(Some)
-                }
-            }
+            // Reasonably safe: The backing image is supposed to be read-only.  We could run into
+            // trouble if a guest is on a raw image, which is then snapshotted, and now we see a
+            // qcow2 image; but let’s rely on such images always having a backing format set.
+            None => match unsafe { Self::probe(&file) }.await {
+                Ok(true) => self.open_qcow2_backing_file(file, gate).await.map(Some),
+                Ok(false) => self.open_raw_backing_file(file, gate).await.map(Some),
+                Err(err) => Err(err),
+            },
         };
 
         result.err_context(|| format!("Backing file {absolute:?}"))
@@ -293,18 +352,35 @@ impl<S: Storage + 'static, F: WrappedFormat<S> + 'static> Qcow2<S, F> {
     /// image, which we call *implicit* dependencies.  This function opens all such implicit
     /// dependencies if they have not been overridden with prior calls to
     /// [`Qcow2::set_data_file()`] or [`Qcow2::set_backing()`], respectively.
-    pub async fn open_implicit_dependencies(&mut self) -> io::Result<()> {
+    ///
+    /// Any image or file is opened through `gate`.
+    pub async fn open_implicit_dependencies_gated<G: ImplicitOpenGate<S>>(
+        &mut self,
+        mut gate: G,
+    ) -> io::Result<()> {
         if !self.storage_set {
-            self.storage = self.open_implicit_data_file().await?;
+            self.storage = self.open_implicit_data_file(&mut gate).await?;
             self.storage_set = true;
         }
 
         if !self.backing_set {
-            self.backing = self.open_implicit_backing_file().await?;
+            self.backing = self.open_implicit_backing_file(&mut gate).await?;
             self.backing_set = true;
         }
 
         Ok(())
+    }
+
+    /// Open all implicit dependencies, ungated.
+    ///
+    /// Same as [`Qcow2::open_implicit_dependencies_gated`], but does not perform any gating on
+    /// implicitly opened images/files.
+    ///
+    /// See the cautionary notes on [`PermissiveImplicitOpenGate`] on
+    /// [`FormatDriverInstance::probe()`] on why this may be dangerous.
+    pub async fn open_implicit_dependencies(&mut self) -> io::Result<()> {
+        self.open_implicit_dependencies_gated(PermissiveImplicitOpenGate::default())
+            .await
     }
 
     /// Require write access, i.e. return an error for read-only images.
@@ -313,21 +389,79 @@ impl<S: Storage + 'static, F: WrappedFormat<S> + 'static> Qcow2<S, F> {
             .then_some(())
             .ok_or_else(|| io::Error::other("Image is read-only"))
     }
+
+    /// Check whether `length + offset` is within the disk size.
+    fn check_disk_bounds<D: Display>(&self, length: u64, offset: u64, req: D) -> io::Result<()> {
+        let size = self.header.size();
+        let length_until_eof = size.saturating_sub(offset);
+        if length_until_eof >= length {
+            Ok(())
+        } else {
+            Err(io::Error::new(
+                io::ErrorKind::UnexpectedEof,
+                format!("Cannot {req} beyond the disk size ({length} + {offset} > {size}"),
+            ))
+        }
+    }
+
+    /// Check whether we support the given preallocation mode.
+    ///
+    /// `with_backing` designates whether the (new) image (should) have a backing file.
+    fn check_valid_preallocation(
+        prealloc_mode: PreallocateMode,
+        with_backing: bool,
+    ) -> io::Result<()> {
+        if !with_backing {
+            return Ok(());
+        }
+
+        match prealloc_mode {
+            PreallocateMode::None | PreallocateMode::Zero => Ok(()),
+
+            PreallocateMode::FormatAllocate
+            | PreallocateMode::FullAllocate
+            | PreallocateMode::WriteData => Err(io::Error::new(
+                io::ErrorKind::Unsupported,
+                "Preallocation is not yet supported for images with a backing file",
+            )),
+        }
+    }
 }
 
 #[async_trait(?Send)]
 impl<S: Storage, F: WrappedFormat<S>> FormatDriverInstance for Qcow2<S, F> {
     type Storage = S;
 
+    fn format(&self) -> Format {
+        Format::Qcow2
+    }
+
+    async unsafe fn probe(metadata: &S) -> io::Result<bool>
+    where
+        Self: Sized,
+    {
+        let mut magic_version = [0u8; 8];
+        metadata.read(&mut magic_version[..], 0).await?;
+
+        let magic = u32::from_be_bytes((&magic_version[..4]).try_into().unwrap());
+        let version = u32::from_be_bytes((&magic_version[4..]).try_into().unwrap());
+        Ok(magic == MAGIC && (version == 2 || (version == 3)))
+    }
+
     fn size(&self) -> u64 {
         self.header.size()
+    }
+
+    fn zero_granularity(&self) -> Option<u64> {
+        self.header.require_version(3).ok()?;
+        Some(self.header.cluster_size() as u64)
     }
 
     fn collect_storage_dependencies(&self) -> Vec<&S> {
         let mut v = self
             .backing
             .as_ref()
-            .map(|b| b.unwrap().collect_storage_dependencies())
+            .map(|b| b.inner().collect_storage_dependencies())
             .unwrap_or_default();
 
         v.push(&self.metadata);
@@ -346,9 +480,9 @@ impl<S: Storage, F: WrappedFormat<S>> FormatDriverInstance for Qcow2<S, F> {
         &'a self,
         offset: u64,
         max_length: u64,
-    ) -> io::Result<(Mapping<'a, S>, u64)> {
+    ) -> io::Result<(ShallowMapping<'a, S>, u64)> {
         let length_until_eof = match self.header.size().checked_sub(offset) {
-            None | Some(0) => return Ok((Mapping::Eof, 0)),
+            None | Some(0) => return Ok((ShallowMapping::Eof {}, 0)),
             Some(length) => length,
         };
 
@@ -363,10 +497,7 @@ impl<S: Storage, F: WrappedFormat<S>> FormatDriverInstance for Qcow2<S, F> {
         length: u64,
         overwrite: bool,
     ) -> io::Result<(&'a S, u64, u64)> {
-        let length_until_eof = self.header.size().saturating_sub(offset);
-        if length_until_eof < length {
-            return Err(io::Error::other("Cannot allocate beyond the disk size"));
-        }
+        self.check_disk_bounds(offset, length, "allocate")?;
 
         if length == 0 {
             return Ok((self.storage(), 0, 0));
@@ -374,7 +505,60 @@ impl<S: Storage, F: WrappedFormat<S>> FormatDriverInstance for Qcow2<S, F> {
 
         self.need_writable()?;
         let offset = GuestOffset(offset);
-        self.do_ensure_data_mapping(offset, length, overwrite).await
+        self.do_ensure_data_mapping(offset, length, overwrite, false)
+            .await
+    }
+
+    async fn ensure_zero_mapping(&self, offset: u64, length: u64) -> io::Result<(u64, u64)> {
+        self.need_writable()?;
+        self.check_disk_bounds(offset, length, "write")?;
+
+        self.ensure_fixed_mapping(
+            GuestOffset(offset),
+            length,
+            FixedMapping::ZeroRetainAllocation,
+        )
+        .await
+        .map(|(ofs, len)| (ofs.0, len))
+    }
+
+    async unsafe fn discard_to_zero_unsafe(
+        &self,
+        offset: u64,
+        length: u64,
+    ) -> io::Result<(u64, u64)> {
+        self.need_writable()?;
+        self.check_disk_bounds(offset, length, "discard")?;
+
+        // Safe to discard: We have a mutable `self` reference
+        // Note this will return an `Unsupported` error for v2 images.  That’s OK, safely
+        // discarding on them is a hairy affair, and they are really outdated by now.
+        self.ensure_fixed_mapping(GuestOffset(offset), length, FixedMapping::ZeroDiscard)
+            .await
+            .map(|(ofs, len)| (ofs.0, len))
+    }
+
+    async unsafe fn discard_to_any_unsafe(
+        &self,
+        offset: u64,
+        length: u64,
+    ) -> io::Result<(u64, u64)> {
+        // Safe: Our caller guarantees that invalidating mappings is safe
+        unsafe { self.discard_to_zero_unsafe(offset, length).await }
+    }
+
+    async unsafe fn discard_to_backing_unsafe(
+        &self,
+        offset: u64,
+        length: u64,
+    ) -> io::Result<(u64, u64)> {
+        self.need_writable()?;
+        self.check_disk_bounds(offset, length, "discard")?;
+
+        // Safe to discard: We have a mutable `self` reference
+        self.ensure_fixed_mapping(GuestOffset(offset), length, FixedMapping::FullDiscard)
+            .await
+            .map(|(ofs, len)| (ofs.0, len))
     }
 
     async fn readv_special(&self, bufv: IoVectorMut<'_>, offset: u64) -> io::Result<()> {
@@ -403,6 +587,167 @@ impl<S: Storage, F: WrappedFormat<S>> FormatDriverInstance for Qcow2<S, F> {
         }
         // Backing file is read-only, so need not be synced from us.
         Ok(())
+    }
+
+    async unsafe fn invalidate_cache(&self) -> io::Result<()> {
+        // Safe: Caller says we should do this
+        unsafe { self.l2_cache.invalidate() }.await?;
+        if let Some(allocator) = self.allocator.as_ref() {
+            let allocator = allocator.lock().await;
+            // Safe: Caller says we should do this
+            unsafe { allocator.invalidate_rb_cache() }.await?;
+        }
+
+        // Safe: Caller says we should do this
+        unsafe { self.metadata.invalidate_cache() }.await?;
+        if let Some(storage) = self.storage.as_ref() {
+            // Safe: Caller says we should do this
+            unsafe { storage.invalidate_cache() }.await?;
+        }
+        if let Some(backing) = self.backing.as_ref() {
+            // Safe: Caller says we should do this
+            unsafe { backing.inner().invalidate_cache() }.await?;
+        }
+
+        // TODO: Ideally we would reload the whole image header, but that would require putting it
+        // in a lock.  We probably do not want to put things like cluster_bits behind a lock.  For
+        // the time being, all we need to reload are things that are mutable at runtime anyway
+        // (because the source instance would not have been able to change other things), so just
+        // reload the L1 and refcount table positions.
+        let new_header = Header::load(self.metadata.as_ref(), false).await?;
+        self.header.update(&new_header)?;
+
+        if let Some(allocator) = self.allocator.as_ref() {
+            *allocator.lock().await =
+                Allocator::new(Arc::clone(&self.metadata), Arc::clone(&self.header)).await?;
+        }
+
+        // Alignment checked in `load()`
+        let l1_cluster = self
+            .header
+            .l1_table_offset()
+            .cluster(self.header.cluster_bits());
+
+        *self.l1_table.write().await = L1Table::load(
+            self.metadata.as_ref(),
+            &self.header,
+            l1_cluster,
+            self.header.l1_table_entries(),
+        )
+        .await?;
+
+        Ok(())
+    }
+
+    async fn resize_grow(&self, new_size: u64, prealloc_mode: PreallocateMode) -> io::Result<()> {
+        self.need_writable()?;
+
+        let old_size = self.size();
+        let grown_length = new_size.saturating_sub(old_size);
+        if grown_length == 0 {
+            return Ok(()); // only grow, else do nothing
+        }
+
+        Self::check_valid_preallocation(prealloc_mode, self.backing.is_some())?;
+
+        if let Some(data_file) = self.storage.as_ref() {
+            // Options that allocate data mappings in qcow2 will resize the data file via
+            // `preallocate()`.  Those that don’t won’t, so they need to be handled here.
+            match prealloc_mode {
+                PreallocateMode::None => {
+                    data_file
+                        .resize(new_size, storage::PreallocateMode::None)
+                        .await?;
+                }
+                PreallocateMode::Zero => {
+                    data_file
+                        .resize(new_size, storage::PreallocateMode::Zero)
+                        .await?;
+                }
+                PreallocateMode::FormatAllocate
+                | PreallocateMode::FullAllocate
+                | PreallocateMode::WriteData => (),
+            }
+        }
+
+        // QEMU requires the L1 table to at least match the image’s size.
+        // On that note, note that this would make an L1 state’s data visible to the guest (and
+        // also effectively invalidate it, because it is no longer L1 state, but just data), but
+        // QEMU does not care either.  (We could see whether there are allocated clusters after the
+        // image end to find out.)
+        {
+            let l1_locked = self.l1_table.write().await;
+            let l1_index =
+                GuestOffset(new_size.saturating_sub(1)).l1_index(self.header.cluster_bits());
+            let _l1_locked = self.grow_l1_table(l1_locked, l1_index).await?;
+        }
+
+        // Preallocate the entire new range (beyond the current image end)
+        match prealloc_mode {
+            PreallocateMode::None => (),
+            PreallocateMode::Zero => self.preallocate_zero(old_size, grown_length).await?,
+            PreallocateMode::FormatAllocate => {
+                self.preallocate(old_size, grown_length, storage::PreallocateMode::Zero)
+                    .await?;
+            }
+            PreallocateMode::FullAllocate => {
+                self.preallocate(old_size, grown_length, storage::PreallocateMode::Allocate)
+                    .await?;
+            }
+            PreallocateMode::WriteData => {
+                self.preallocate(old_size, grown_length, storage::PreallocateMode::WriteData)
+                    .await?
+            }
+        }
+
+        // Now that preallocation is complete, it’s safe to actually set the new size (otherwise
+        // someone might see a backing image’s data peek through briefly in case it is longer than
+        // `old_size`)
+        self.header.set_size(new_size);
+        self.header
+            .write_size(self.metadata.as_ref())
+            .await
+            .inspect_err(|_| {
+                // Reset to old size
+                self.header.set_size(old_size)
+            })
+    }
+
+    async fn resize_shrink(&mut self, new_size: u64) -> io::Result<()> {
+        self.need_writable()?;
+
+        let old_size = self.size();
+        if new_size >= old_size {
+            return Ok(()); // only shrink, else do nothing
+        }
+
+        if let Some(data_file) = self.storage.as_ref() {
+            data_file
+                .resize(new_size, storage::PreallocateMode::None)
+                .await?;
+        }
+
+        let mut offset = new_size;
+        while offset < old_size {
+            match self.discard_to_backing(offset, old_size - offset).await {
+                Ok((_, 0)) => break, // cannot discard tail
+                Ok((dofs, dlen)) => offset = dofs + dlen,
+                // Basically ignore errors, but stop trying to discard
+                Err(_) => break,
+            }
+        }
+
+        // Shrink after discarding (so we can discard)
+        self.header.set_size(new_size);
+
+        // Do this last because we may not be able to undo it
+        self.header
+            .write_size(self.metadata.as_ref())
+            .await
+            .inspect_err(|_| {
+                // Reset to old size
+                self.header.set_size(old_size);
+            })
     }
 }
 

@@ -11,7 +11,7 @@
          size: u64,
 --- a/src/rutabaga_gfx/src/virgl_renderer.rs
 +++ b/src/rutabaga_gfx/src/virgl_renderer.rs
-@@ -702,7 +702,7 @@
+@@ -707,7 +707,7 @@
          #[cfg(feature = "virgl_resource_map2")]
          {
              let ret = unsafe {

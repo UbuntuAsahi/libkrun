@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: Apache-2.0
 
+use nix::errno::Errno;
 use std::{fmt, io};
 
 const NE_ERR_VCPU_ALREADY_USED: i32 = 256;
@@ -33,7 +34,7 @@ pub enum LaunchError {
     MemInit(MemInitError),
 
     /// Error occuring when randomly-generating an enclave CID.
-    CidRandomGenerate,
+    CidInvalid,
 }
 
 impl LaunchError {
@@ -43,12 +44,18 @@ impl LaunchError {
     }
 }
 
+impl From<nix::errno::Errno> for LaunchError {
+    fn from(_e: nix::errno::Errno) -> Self {
+        LaunchError::Ioctl(IoctlError::from_errno())
+    }
+}
+
 impl fmt::Display for LaunchError {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
         let msg = match self {
             Self::Ioctl(e) => format!("ioctl error: {e}"),
             Self::MemInit(e) => format!("memory initialization error: {e}"),
-            Self::CidRandomGenerate => "unable to randomly-generate enclave CID".to_string(),
+            Self::CidInvalid => "the value of the provided CID is invalid".to_string(),
         };
 
         write!(f, "{}", msg)
@@ -131,29 +138,28 @@ pub enum IoctlError {
     InvalidEnclaveCid,
 
     /// Unknown.
-    Unknown(std::io::Error),
+    Unknown(Errno),
 }
 
 impl IoctlError {
     /// Parse an error from errno.
     pub fn from_errno() -> Self {
-        Self::from(std::io::Error::last_os_error())
+        Self::from(Errno::last())
     }
 }
 
-impl From<std::io::Error> for IoctlError {
-    fn from(err: std::io::Error) -> Self {
-        match err.raw_os_error() {
-            Some(mut e) => {
-                if e < 0 {
-                    e = -e;
-                }
-
-                match e {
-                    libc::EFAULT => Self::CopyToUser,
-                    libc::ENOMEM => Self::InternalMemAllocation,
-                    libc::EIO => Self::DifferentTaskMm,
-                    libc::EINVAL => Self::InvalidPhysicalMemRegion,
+impl From<Errno> for IoctlError {
+    fn from(err: Errno) -> Self {
+        match err {
+            // Standard error codes.
+            Errno::EFAULT => Self::CopyToUser,
+            Errno::ENOMEM => Self::InternalMemAllocation,
+            Errno::EIO => Self::DifferentTaskMm,
+            Errno::EINVAL => Self::InvalidPhysicalMemRegion,
+            _ => {
+                let raw = err as i32;
+                match raw {
+                    // Nitro-specific error codes.
                     NE_ERR_VCPU_ALREADY_USED => Self::VcpuAlreadyUsed,
                     NE_ERR_VCPU_NOT_IN_CPU_POOL => Self::VcpuNotInCpuPool,
                     NE_ERR_VCPU_INVALID_CPU_CORE => Self::VcpuInvalidCpuCore,
@@ -177,7 +183,6 @@ impl From<std::io::Error> for IoctlError {
                     _ => Self::Unknown(err),
                 }
             }
-            None => Self::Unknown(err),
         }
     }
 }

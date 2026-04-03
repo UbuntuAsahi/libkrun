@@ -28,9 +28,7 @@
 //!
 //! let mapping = image.get_mapping(test_offset, 1).await?.0;
 //! let Mapping::Raw {
-//!     storage,
-//!     offset,
-//!     writable,
+//!     storage, offset, ..
 //! } = mapping
 //! else {
 //!     panic!("Raw mapping expected");
@@ -44,7 +42,8 @@
 
 use crate::io_buffers::{IoVector, IoVectorMut};
 use crate::storage::drivers::CommonStorageHelper;
-use crate::{Storage, StorageOpenOptions};
+use crate::storage::PreallocateMode;
+use crate::{Storage, StorageCreateOptions, StorageOpenOptions};
 use std::fmt::{self, Debug, Display, Formatter};
 use std::io;
 use std::ops::{Deref, DerefMut};
@@ -101,6 +100,10 @@ impl<T: Debug + Default + Display + Send + Sync, S: Storage> Storage for Annotat
         Ok(S::open_sync(opts)?.into())
     }
 
+    async fn create_open(opts: StorageCreateOptions) -> io::Result<Self> {
+        Ok(S::create_open(opts).await?.into())
+    }
+
     fn mem_align(&self) -> usize {
         self.inner.mem_align()
     }
@@ -115,6 +118,10 @@ impl<T: Debug + Default + Display + Send + Sync, S: Storage> Storage for Annotat
 
     fn resolve_relative_path<P: AsRef<Path>>(&self, relative: P) -> io::Result<PathBuf> {
         self.inner.resolve_relative_path(relative)
+    }
+
+    fn get_filename(&self) -> Option<PathBuf> {
+        self.inner.get_filename()
     }
 
     async unsafe fn pure_readv(&self, bufv: IoVectorMut<'_>, offset: u64) -> io::Result<()> {
@@ -145,9 +152,18 @@ impl<T: Debug + Default + Display + Send + Sync, S: Storage> Storage for Annotat
         self.inner.sync().await
     }
 
+    async unsafe fn invalidate_cache(&self) -> io::Result<()> {
+        // Safety ensured by caller
+        unsafe { self.inner.invalidate_cache() }.await
+    }
+
     fn get_storage_helper(&self) -> &CommonStorageHelper {
         // Share storage helper from inner (to e.g. get same request serialization)
         self.inner.get_storage_helper()
+    }
+
+    async fn resize(&self, new_size: u64, prealloc_mode: PreallocateMode) -> io::Result<()> {
+        self.inner.resize(new_size, prealloc_mode).await
     }
 }
 

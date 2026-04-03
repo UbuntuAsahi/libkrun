@@ -1,20 +1,11 @@
---- libkrun-1.15.1.orig/Makefile
-+++ libkrun-1.15.1/Makefile
-@@ -90,7 +90,7 @@ ifeq ($(PREFIX),)
+--- a/Makefile
++++ b/Makefile
+@@ -110,7 +110,7 @@
      PREFIX := /usr/local
  endif
  
--.PHONY: install clean test $(LIBRARY_RELEASE_$(OS)) $(LIBRARY_DEBUG_$(OS)) libkrun.pc
+-.PHONY: install clean test test-prefix $(LIBRARY_RELEASE_$(OS)) $(LIBRARY_DEBUG_$(OS)) libkrun.pc clean-sysroot clean-all
 +.PHONY: install clean
  
  all: $(LIBRARY_RELEASE_$(OS)) libkrun.pc
  
-@@ -141,7 +141,7 @@ libkrun.pc: libkrun.pc.in Makefile
- 	    libkrun.pc.in > $@-t
- 	mv $@-t $@
- 
--install: libkrun.pc
-+install:
- 	install -d $(DESTDIR)$(PREFIX)/$(LIBDIR_$(OS))/
- 	install -d $(DESTDIR)$(PREFIX)/$(LIBDIR_$(OS))/pkgconfig
- 	install -d $(DESTDIR)$(PREFIX)/include

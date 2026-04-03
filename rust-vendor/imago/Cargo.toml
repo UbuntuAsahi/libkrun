@@ -12,7 +12,7 @@
 [package]
 edition = "2021"
 name = "imago"
-version = "0.1.4"
+version = "0.2.1"
 build = "build.rs"
 autolib = false
 autobins = false
@@ -40,25 +40,23 @@ path = "src/lib.rs"
 version = "0.1"
 
 [dependencies.bincode]
-version = "1.3"
+version = "2"
+features = ["derive"]
+default-features = false
 
 [dependencies.cfg-if]
-version = "1.0.0"
+version = "1"
 
 [dependencies.miniz_oxide]
 version = "0.8"
 features = ["std"]
 
 [dependencies.nix]
-version = "0.29.0"
+version = "0.30"
 features = ["ioctl"]
 
 [dependencies.page_size]
 version = "0.6"
-
-[dependencies.serde]
-version = "1.0"
-features = ["derive"]
 
 [dependencies.tokio]
 version = "1"
@@ -68,7 +66,7 @@ features = ["sync"]
 version = "0.1"
 
 [dependencies.vm-memory]
-version = "0.16"
+version = ">=0.16, <0.19"
 optional = true
 
 [dev-dependencies.tokio]
@@ -76,13 +74,13 @@ version = "1"
 features = ["rt"]
 
 [build-dependencies.rustc_version]
-version = "0.4.0"
+version = "0.4"
 
 [target."cfg(unix)".dependencies.libc]
 version = "0.2"
 
 [target."cfg(windows)".dependencies.windows-sys]
-version = "0.59"
+version = "0.61"
 features = [
     "Win32_Foundation",
     "Win32_Storage_FileSystem",

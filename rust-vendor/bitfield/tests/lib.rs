@@ -21,6 +21,27 @@ impl From<Foo> for u8 {
     }
 }
 
+#[derive(Copy, Clone, Debug, Eq, PartialEq)]
+pub struct EvenU8(u8);
+
+impl From<EvenU8> for u8 {
+    fn from(value: EvenU8) -> u8 {
+        value.0
+    }
+}
+
+impl TryFrom<u8> for EvenU8 {
+    type Error = ();
+
+    fn try_from(value: u8) -> Result<Self, Self::Error> {
+        if value % 2 == 0 {
+            Ok(EvenU8(value))
+        } else {
+            Err(())
+        }
+    }
+}
+
 bitfield! {
     #[derive(Copy, Clone)]
     /// documentation comments also work!
@@ -61,6 +82,10 @@ bitfield! {
     from into Foo, _, set_from_foo4: 31, 31;
     from into Foo, from_foo5, set_from_foo5: 29, 29, 3;
     from into Foo, from_foo6, _: 31, 31;
+    from try_into EvenU8, from_foo7, set_from_foo7: 31, 30;
+    try_into EvenU8, from_foo8, set_from_foo8: 31, 30;
+    try_into EvenU8, from_foo9, set_from_foo9: 8, 8, 3;
+
     i8;
     signed_single_bit, set_signed_single_bit: 0, 0;
     signed_two_bits, set_signed_two_bits: 1, 0;
@@ -99,6 +124,11 @@ impl FooBar {
         u8, mask, _: 2,0;
         u8, from, _: 2,0;
         u8, into, _: 2,0;
+    }
+
+    bitfield_fields! {
+        u8, lsb_msb_inverted, set_lsb_msb_inverted: 1, 3;
+        u8, lsb_msb_inverted_array, set_lsb_msb_inverted_array: 2, 3, 2;
     }
 }
 
@@ -196,6 +226,47 @@ fn test_bool_array_field() {
     assert!(!fb.bool_array_getter(0));
     assert!(fb.bool_array_getter(1));
     assert!(!fb.bool_array_getter(2));
+}
+
+#[test]
+fn test_try_into() {
+    let mut fb = FooBar(0);
+    assert_eq!(fb.from_foo7(), Ok(EvenU8(0)));
+    assert_eq!(fb.from_foo8(), Ok(EvenU8(0)));
+    fb.set_from_foo7(EvenU8(1));
+    assert_eq!(fb.from_foo7(), Err(()));
+    assert_eq!(fb.from_foo8(), Err(()));
+    fb.set_from_foo8(2);
+    assert_eq!(fb.from_foo7(), Ok(EvenU8(2)));
+    assert_eq!(fb.from_foo8(), Ok(EvenU8(2)));
+}
+
+#[test]
+#[should_panic(expected = "the MSB (1) is smaller than the LSB (3), you likely inverted them")]
+fn lsb_msb_inverted_should_panic_on_access_1() {
+    let fb = FooBar(0);
+    fb.lsb_msb_inverted();
+}
+
+#[test]
+#[should_panic(expected = "the MSB (1) is smaller than the LSB (3), you likely inverted them")]
+fn lsb_msb_inverted_should_panic_on_access_2() {
+    let mut fb = FooBar(0);
+    fb.set_lsb_msb_inverted(1);
+}
+
+#[test]
+#[should_panic(expected = "the MSB (2) is smaller than the LSB (3), you likely inverted them")]
+fn lsb_msb_inverted_should_panic_on_access_3() {
+    let fb = FooBar(0);
+    fb.lsb_msb_inverted_array(0);
+}
+
+#[test]
+#[should_panic(expected = "the MSB (2) is smaller than the LSB (3), you likely inverted them")]
+fn lsb_msb_inverted_should_panic_on_access_4() {
+    let mut fb = FooBar(0);
+    fb.set_lsb_msb_inverted_array(0, 1);
 }
 
 bitfield! {
@@ -552,7 +623,7 @@ fn test_is_copy() {
 #[test]
 fn test_debug() {
     let fb = FooBar(1_234_567_890);
-    let expected = "FooBar { .0: 1234567890, foo1: 0, foo2: 0, foo3: 2, foo3: 2, foo4: 4, foo5: [0, 1, 0, 0, 1, 0, 1, 1, 0, 1, 0, 0, 0, 0, 0, 0, 0, 1, 1, 0, 1, 0, 0, 1, 1, 0, 0, 1, 0, 0, 1, 0], foo6: [2, 3, 1], getter_only: 1, pub_getter_only: 1, getter_only_array: [2, 3, 1], all_bits: 1234567890, single_bit: false, into_foo1: Foo(0), into_foo2: Foo(0), from_foo1: Foo(0), into_foo3: Foo(0), into_foo4: Foo(0), into_foo6: [Foo(0), Foo(1), Foo(0)], from_foo3: Foo(0), from_foo5: [Foo(0), Foo(1), Foo(0)], from_foo6: Foo(0), signed_single_bit: 0, signed_two_bits: -2, signed_eight_bits: -46, signed_eight_bits_unaligned: 105, u128_getter: 105, i128_getter: 105, bool_array_getter: [false, true, false] }";
+    let expected = "FooBar { .0: 1234567890, foo1: 0, foo2: 0, foo3: 2, foo3: 2, foo4: 4, foo5: [0, 1, 0, 0, 1, 0, 1, 1, 0, 1, 0, 0, 0, 0, 0, 0, 0, 1, 1, 0, 1, 0, 0, 1, 1, 0, 0, 1, 0, 0, 1, 0], foo6: [2, 3, 1], getter_only: 1, pub_getter_only: 1, getter_only_array: [2, 3, 1], all_bits: 1234567890, single_bit: false, into_foo1: Foo(0), into_foo2: Foo(0), from_foo1: Foo(0), into_foo3: Foo(0), into_foo4: Foo(0), into_foo6: [Foo(0), Foo(1), Foo(0)], from_foo3: Foo(0), from_foo5: [Foo(0), Foo(1), Foo(0)], from_foo6: Foo(0), from_foo7: Err(()), from_foo8: Err(()), from_foo9: [Ok(EvenU8(0)), Err(()), Ok(EvenU8(0))], signed_single_bit: 0, signed_two_bits: -2, signed_eight_bits: -46, signed_eight_bits_unaligned: 105, u128_getter: 105, i128_getter: 105, bool_array_getter: [false, true, false] }";
     assert_eq!(expected, format!("{:?}", fb))
 }
 
@@ -578,6 +649,13 @@ bitfield! {
     u8, from into Foo, into_from_foo1, set_into_from_foo1: 21, 20;
     u8, into Foo, into_foo2, set_into_foo2: 23, 22;
     u8, from Foo, from_foo3, set_from_foo3: 25, 24;
+}
+
+impl ArrayBitfield<[u8; 3]> {
+    bitfield_fields! {
+        u8, lsb_msb_inverted, set_lsb_msb_inverted: 3, 4;
+        u8, lsb_msb_inverted_array, set_lsb_msb_inverted_array: 4, 5, 2;
+    }
 }
 
 #[test]
@@ -682,6 +760,34 @@ fn test_arraybitfield() {
 }
 
 #[test]
+#[should_panic(expected = "the MSB (3) is smaller than the LSB (4), you likely inverted them")]
+fn lsb_msb_inverted_should_panic_on_access_with_array_bitfield_1() {
+    let ab = ArrayBitfield([0; 3]);
+    ab.lsb_msb_inverted();
+}
+
+#[test]
+#[should_panic(expected = "the MSB (3) is smaller than the LSB (4), you likely inverted them")]
+fn lsb_msb_inverted_should_panic_on_access_with_array_bitfield_2() {
+    let mut ab = ArrayBitfield([0; 3]);
+    ab.set_lsb_msb_inverted(1);
+}
+
+#[test]
+#[should_panic(expected = "the MSB (4) is smaller than the LSB (5), you likely inverted them")]
+fn lsb_msb_inverted_should_panic_on_access_with_array_bitfield_3() {
+    let ab = ArrayBitfield([0; 3]);
+    ab.lsb_msb_inverted_array(0);
+}
+
+#[test]
+#[should_panic(expected = "the MSB (4) is smaller than the LSB (5), you likely inverted them")]
+fn lsb_msb_inverted_should_panic_on_access_with_array_bitfield_4() {
+    let mut ab = ArrayBitfield([0; 3]);
+    ab.set_lsb_msb_inverted_array(1, 1);
+}
+
+#[test]
 fn test_arraybitfield2() {
     // Check that the macro can be called from a function.
     bitfield! {
@@ -746,6 +852,13 @@ bitfield! {
     signed_foo2, set_signed_foo2: 7, 0;
     signed_foo3, set_signed_foo3: 8, 1;
     signed_foo4, set_signed_foo4: 19, 4;
+}
+
+impl ArrayBitfieldMsb0<[u8; 3]> {
+    bitfield_fields! {
+        u8, lsb_msb_inverted, set_lsb_msb_inverted: 3, 4;
+        u8, lsb_msb_inverted_array, set_lsb_msb_inverted_array: 4, 5, 2;
+    }
 }
 
 #[test]
@@ -838,6 +951,34 @@ fn test_arraybitfield_msb0() {
     ab.set_signed_foo3(0);
     ab.set_signed_foo4(-1);
     assert_eq!([0x0F, 0xFF, 0xF0], ab.0);
+}
+
+#[test]
+#[should_panic(expected = "the MSB (3) is smaller than the LSB (4), you likely inverted them")]
+fn lsb_msb_inverted_should_panic_on_access_with_array_msb0_bitfield_1() {
+    let ab = ArrayBitfieldMsb0([0; 3]);
+    ab.lsb_msb_inverted();
+}
+
+#[test]
+#[should_panic(expected = "the MSB (3) is smaller than the LSB (4), you likely inverted them")]
+fn lsb_msb_inverted_should_panic_on_access_with_array_msb0_bitfield_2() {
+    let mut ab = ArrayBitfieldMsb0([0; 3]);
+    ab.set_lsb_msb_inverted(1);
+}
+
+#[test]
+#[should_panic(expected = "the MSB (4) is smaller than the LSB (5), you likely inverted them")]
+fn lsb_msb_inverted_should_panic_on_access_with_array_msb0_bitfield_3() {
+    let ab = ArrayBitfieldMsb0([0; 3]);
+    ab.lsb_msb_inverted_array(0);
+}
+
+#[test]
+#[should_panic(expected = "the MSB (4) is smaller than the LSB (5), you likely inverted them")]
+fn lsb_msb_inverted_should_panic_on_access_with_array_msb0_bitfield_4() {
+    let mut ab = ArrayBitfieldMsb0([0; 3]);
+    ab.set_lsb_msb_inverted_array(1, 1);
 }
 
 #[test]
@@ -1305,4 +1446,44 @@ pub mod deny_missing_docs {
         /// A doc comment for the methods
         pub field1, set_field1: 0;
     }
+}
+
+bitfield! {
+    #[derive(Copy, Clone)]
+    /// documentation comments also work!
+    struct FooBarSigned(i32);
+    impl Debug;
+    impl BitOr;
+    foo1, set_foo1: 31, 8;
+    foo2, set_foo2: 10, 10, 2;
+    mask A_MASK(u32), foo3, set_foo3: 3, 1;
+    u8;
+    foo4, set_foo4: THREE, 0;
+    u32, foo5, set_foo5: 31,8;
+}
+
+#[test]
+fn field_type_signed() {
+    let fbs = FooBarSigned(0);
+    let _: i32 = fbs.foo1();
+    let _: i32 = fbs.foo2(0);
+    let _: i32 = fbs.foo3();
+    let _: u8 = fbs.foo4();
+    let _: u32 = fbs.foo5();
+}
+
+#[test]
+fn value_signed() {
+    let initial_value = 0b1101_0101_1010_1010_1010_1010_0110_0010u32 as i32;
+    let fbs = FooBarSigned(initial_value);
+    assert_eq!(
+        fbs.foo1(),
+        0b1111_1111_1101_0101_1010_1010_1010_1010u32 as i32
+    );
+    assert_eq!(fbs.foo5(), 0b1101_0101_1010_1010_1010_1010u32);
+}
+
+#[test]
+fn mask_signed() {
+    assert_eq!(FooBarSigned::A_MASK, 0b1110u32);
 }

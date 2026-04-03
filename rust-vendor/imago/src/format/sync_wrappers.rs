@@ -1,6 +1,7 @@
 //! Synchronous wrapper around [`FormatAccess`].
 
 use super::drivers::FormatDriverInstance;
+use super::PreallocateMode;
 use crate::io_buffers::{IoVector, IoVectorMut};
 use crate::{FormatAccess, Mapping, Storage};
 use std::io;
@@ -8,7 +9,7 @@ use std::io;
 /// Synchronous wrapper around [`FormatAccess`].
 ///
 /// Creates and keeps a tokio runtime in which to run I/O.
-pub struct SyncFormatAccess<S: Storage> {
+pub struct SyncFormatAccess<S: Storage + 'static> {
     /// Wrapped asynchronous [`FormatAccess`].
     inner: FormatAccess<S>,
 
@@ -16,7 +17,7 @@ pub struct SyncFormatAccess<S: Storage> {
     runtime: tokio::runtime::Runtime,
 }
 
-impl<S: Storage> SyncFormatAccess<S> {
+impl<S: Storage + 'static> SyncFormatAccess<S> {
     /// Like [`FormatAccess::new()`], but create a synchronous wrapper.
     pub fn new<D: FormatDriverInstance<Storage = S> + 'static>(inner: D) -> io::Result<Self> {
         FormatAccess::new(inner).try_into()
@@ -139,10 +140,127 @@ impl<S: Storage> SyncFormatAccess<S> {
         self.writev(buf.into(), offset)
     }
 
+    /// Ensure the given range reads as zeroes.
+    ///
+    /// May use efficient zeroing for a subset of the given range, if supported by the format.
+    /// Will not discard anything, which keeps existing data mappings usable, albeit writing to
+    /// mappings that are now zeroed may have no effect.
+    ///
+    /// Check if [`SyncFormatAccess::discard_to_zero()`] better suits your needs: It may work
+    /// better on a wider range of formats (`write_zeroes()` requires support for preallocated zero
+    /// clusters, which qcow2 does have, but other formats may not), and can actually free up
+    /// space.  However, because it can break existing data mappings, it requires a mutable `self`
+    /// reference.
+    pub fn write_zeroes(&self, offset: u64, length: u64) -> io::Result<()> {
+        self.runtime
+            .block_on(self.inner.write_zeroes(offset, length))
+    }
+
+    /// Discard the given range, ensure it is read back as zeroes.
+    ///
+    /// Effectively the same as [`SyncFormatAccess::write_zeroes()`], but discard as much of the
+    /// existing allocation as possible.  This breaks existing data mappings, so needs a mutable
+    /// reference to `self`, which ensures that existing data references (which have the lifetime
+    /// of an immutable `self` reference) cannot be kept.
+    ///
+    /// Areas that cannot be discarded (because of format-inherent alignment restrictions) are
+    /// still overwritten with zeroes, unless discarding is not supported altogether.
+    pub fn discard_to_zero(&mut self, offset: u64, length: u64) -> io::Result<()> {
+        self.runtime
+            .block_on(self.inner.discard_to_zero(offset, length))
+    }
+
+    /// Discard the given range, ensure it is read back as zeroes.
+    ///
+    /// Unsafe variant of [`SyncFormatAccess::discard_to_zero()`], only requiring an immutable
+    /// `&self`.
+    ///
+    /// # Safety
+    ///
+    /// This function may invalidate existing data mappings.  The caller must ensure to invalidate
+    /// all concurrently existing data mappings they have.  Note that this includes concurrent
+    /// accesses through this type ([`SyncFormatAccess`]), which may hold these mappings internally
+    /// while they run.
+    ///
+    /// One way to ensure safety is to have a mutable reference to `self`, which allows using the
+    /// safe variant [`SyncFormatAccess::discard_to_zero()`].
+    pub unsafe fn discard_to_zero_unsafe(&self, offset: u64, length: u64) -> io::Result<()> {
+        // Safe: Caller guarantees this is safe
+        self.runtime
+            .block_on(unsafe { self.inner.discard_to_zero_unsafe(offset, length) })
+    }
+
+    /// Discard the given range, not guaranteeing specific data on read-back.
+    ///
+    /// Discard as much of the given range as possible, and keep the rest as-is.  Does not
+    /// guarantee any specific data on read-back, in contrast to
+    /// [`SyncFormatAccess::discard_to_zero()`].
+    ///
+    /// Discarding being unsupported by this format is still returned as an error
+    /// ([`std::io::ErrorKind::Unsupported`])
+    pub fn discard_to_any(&mut self, offset: u64, length: u64) -> io::Result<()> {
+        self.runtime
+            .block_on(self.inner.discard_to_any(offset, length))
+    }
+
+    /// Discard the given range, not guaranteeing specific data on read-back.
+    ///
+    /// Unsafe variant of [`SyncFormatAccess::discard_to_any()`], only requiring an immutable
+    /// `&self`.
+    ///
+    /// # Safety
+    ///
+    /// This function may invalidate existing data mappings.  The caller must ensure to invalidate
+    /// all concurrently existing data mappings they have.  Note that this includes concurrent
+    /// accesses through this type ([`SyncFormatAccess`]), which may hold these mappings internally
+    /// while they run.
+    ///
+    /// One way to ensure safety is to have a mutable reference to `self`, which allows using the
+    /// safe variant [`SyncFormatAccess::discard_to_any()`].
+    pub unsafe fn discard_to_any_unsafe(&self, offset: u64, length: u64) -> io::Result<()> {
+        // Safe: Caller guarantees this is safe
+        self.runtime
+            .block_on(unsafe { self.inner.discard_to_any_unsafe(offset, length) })
+    }
+
+    /// Discard the given range, such that the backing image becomes visible.
+    ///
+    /// Discard as much of the given range as possible so that a backing image’s data becomes
+    /// visible, and keep the rest as-is.  This breaks existing data mappings, so needs a mutable
+    /// reference to `self`, which ensures that existing data references (which have the lifetime
+    /// of an immutable `self` reference) cannot be kept.
+    pub fn discard_to_backing(&mut self, offset: u64, length: u64) -> io::Result<()> {
+        self.runtime
+            .block_on(self.inner.discard_to_backing(offset, length))
+    }
+
+    /// Discard the given range, such that the backing image becomes visible.
+    ///
+    /// Unsafe variant of [`SyncFormatAccess::discard_to_backing()`], only requiring an immutable
+    /// `&self`.
+    ///
+    /// # Safety
+    ///
+    /// This function may invalidate existing data mappings.  The caller must ensure to invalidate
+    /// all concurrently existing data mappings they have.  Note that this includes concurrent
+    /// accesses through this type ([`SyncFormatAccess`]), which may hold these mappings internally
+    /// while they run.
+    ///
+    /// One way to ensure safety is to have a mutable reference to `self`, which allows using the
+    /// safe variant [`SyncFormatAccess::discard_to_backing()`].
+    pub unsafe fn discard_to_backing_unsafe(&self, offset: u64, length: u64) -> io::Result<()> {
+        // Safe: Caller guarantees this is safe
+        self.runtime
+            .block_on(unsafe { self.inner.discard_to_backing_unsafe(offset, length) })
+    }
+
     /// Flush internal buffers.
     ///
     /// Does not necessarily sync those buffers to disk.  When using `flush()`, consider whether
     /// you want to call `sync()` afterwards.
+    ///
+    /// Note that this will not drop the buffers, so they may still be used to serve later
+    /// accesses.  Use [`SyncFormatAccess::invalidate_cache()`] to drop all buffers.
     pub fn flush(&self) -> io::Result<()> {
         self.runtime.block_on(self.inner.flush())
     }
@@ -153,6 +271,61 @@ impl<S: Storage> SyncFormatAccess<S> {
     /// `sync()`, consider whether you want to call `flush()` before it.
     pub fn sync(&self) -> io::Result<()> {
         self.runtime.block_on(self.inner.sync())
+    }
+
+    /// Drop internal buffers.
+    ///
+    /// This drops all internal buffers, but does not flush them!  All cached data is reloaded from
+    /// disk on subsequent accesses.
+    ///
+    /// # Safety
+    /// Not flushing internal buffers may cause image corruption.  You must ensure the on-disk
+    /// state is consistent.
+    pub unsafe fn invalidate_cache(&self) -> io::Result<()> {
+        // Safety ensured by caller
+        self.runtime
+            .block_on(unsafe { self.inner.invalidate_cache() })
+    }
+
+    /// Resize to the given size.
+    ///
+    /// Set the disk size to `new_size`.  If `new_size` is smaller than the current size, ignore
+    /// both preallocation modes and discard the data after `new_size`.
+    ///
+    /// If `new_size` is larger than the current size, `prealloc_mode` determines whether and how
+    /// the new range should be allocated; depending on the image format, is possible some
+    /// preallocation modes are not supported, in which case an [`std::io::ErrorKind::Unsupported`]
+    /// is returned.
+    ///
+    /// This may break existing data mappings, so needs a mutable reference to `self`, which
+    /// ensures that existing data references (which have the lifetime of an immutable `self`
+    /// reference) cannot be kept.
+    ///
+    /// See also [`SyncFormatAccess::resize_grow()`] and [`SyncFormatAccess::resize_shrink()`],
+    /// whose more specialized interface may be useful when you know whether you want to grow or
+    /// shrink the image.
+    pub fn resize(&mut self, new_size: u64, prealloc_mode: PreallocateMode) -> io::Result<()> {
+        self.runtime
+            .block_on(self.inner.resize(new_size, prealloc_mode))
+    }
+
+    /// Resize to the given size, which must be greater than the current size.
+    ///
+    /// Set the disk size to `new_size`, preallocating the new space according to `prealloc_mode`.
+    /// Depending on the image format, it is possible some preallocation modes are not supported,
+    /// in which case an [`std::io::ErrorKind::Unsupported`] is returned.
+    pub fn resize_grow(&self, new_size: u64, prealloc_mode: PreallocateMode) -> io::Result<()> {
+        self.runtime
+            .block_on(self.inner.resize_grow(new_size, prealloc_mode))
+    }
+
+    /// Truncate to the given size, which must be smaller than the current size.
+    ///
+    /// Set the disk size to `new_size`, discarding the data after `new_size`.
+    ///
+    /// May break existing data mappings thanks to the mutable `self` reference.
+    pub fn resize_shrink(&mut self, new_size: u64) -> io::Result<()> {
+        self.runtime.block_on(self.inner.resize_shrink(new_size))
     }
 }
 

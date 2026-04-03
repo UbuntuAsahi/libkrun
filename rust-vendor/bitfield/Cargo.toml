@@ -12,7 +12,7 @@
 [package]
 edition = "2021"
 name = "bitfield"
-version = "0.19.1"
+version = "0.19.4"
 authors = ["Loïc Damien <loic.damien@dzamlo.ch>"]
 build = false
 autolib = false
@@ -43,4 +43,4 @@ name = "lib"
 path = "tests/lib.rs"
 
 [dependencies.bitfield-macros]
-version = "0.19.1"
+version = "0.19.4"

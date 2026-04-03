@@ -3,21 +3,21 @@
 //! While not the primary purpose of this crate, to open VM images, we need to be able to access
 //! different kinds of storage objects.  Such objects are abstracted behind the `Storage` trait.
 
-pub(crate) mod drivers;
+pub mod drivers;
 pub mod ext;
 
-use crate::io_buffers::{IoBuffer, IoVector, IoVectorMut};
+use crate::io_buffers::{IoVector, IoVectorMut};
 use drivers::CommonStorageHelper;
-use ext::StorageExt;
+use std::any::Any;
 use std::fmt::{Debug, Display};
 use std::future::Future;
+use std::io;
 use std::path::{Path, PathBuf};
 use std::pin::Pin;
 use std::sync::Arc;
-use std::{cmp, io};
 
 /// Parameters from which a storage object can be constructed.
-#[derive(Clone, Default)]
+#[derive(Clone, Debug, Default)]
 pub struct StorageOpenOptions {
     /// Filename to open.
     pub(crate) filename: Option<PathBuf>,
@@ -27,6 +27,28 @@ pub struct StorageOpenOptions {
 
     /// Whether to bypass the host page cache (if applicable).
     pub(crate) direct: bool,
+
+    /// macOS-only: Use fsync() instead of F_FULLFSYNC on `sync()` method.
+    #[cfg(target_os = "macos")]
+    pub(crate) relaxed_sync: bool,
+}
+
+/// Parameters from which a new storage object can be created.
+#[derive(Clone, Debug)]
+pub struct StorageCreateOptions {
+    /// Options to open the image, includes the filename.
+    ///
+    /// `writable` should be ignored, created files should always be opened as writable.
+    pub(crate) open_opts: StorageOpenOptions,
+
+    /// Initial size.
+    pub(crate) size: u64,
+
+    /// Preallocation mode.
+    pub(crate) prealloc_mode: PreallocateMode,
+
+    /// Whether to overwrite an existing file.
+    pub(crate) overwrite: bool,
 }
 
 /// Implementation for storage objects.
@@ -51,6 +73,31 @@ pub trait Storage: Debug + Display + Send + Sized + Sync {
         tokio::runtime::Builder::new_current_thread()
             .build()?
             .block_on(Self::open(opts))
+    }
+
+    /// Create a storage object and open it.
+    ///
+    /// Different storage implementations may require different options.
+    ///
+    /// Note that newly created storage objects are always opened as writable.
+    #[allow(async_fn_in_trait)] // No need for Send
+    async fn create_open(_opts: StorageCreateOptions) -> io::Result<Self> {
+        Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            format!(
+                "Cannot create storage objects of type {}",
+                std::any::type_name::<Self>()
+            ),
+        ))
+    }
+
+    /// Create a storage object.
+    ///
+    /// Different storage implementations may require different options.
+    #[allow(async_fn_in_trait)] // No need for Send
+    async fn create(opts: StorageCreateOptions) -> io::Result<()> {
+        Self::create_open(opts).await?;
+        Ok(())
     }
 
     /// Minimum required alignment for memory buffers.
@@ -89,6 +136,14 @@ pub trait Storage: Debug + Display + Send + Sized + Sync {
         Err(io::ErrorKind::Unsupported.into())
     }
 
+    /// Return a filename, if possible.
+    ///
+    /// Using the filename for [`StorageOpenOptions::filename()`] should open the same storage
+    /// object.
+    fn get_filename(&self) -> Option<PathBuf> {
+        None
+    }
+
     /// Read data at `offset` into `bufv`.
     ///
     /// Reads until `bufv` is filled completely, i.e. will not do short reads.  When reaching the
@@ -99,7 +154,7 @@ pub trait Storage: Debug + Display + Send + Sized + Sync {
     /// [`Self::mem_align()`] and [`Self::req_align()`], and safeguards we want to implement for
     /// safe concurrent access may not be available.
     ///
-    /// Use [`StorageExt::readv()`] instead.
+    /// Use [`StorageExt::readv()`](crate::StorageExt::readv()) instead.
     #[allow(async_fn_in_trait)] // No need for Send
     async unsafe fn pure_readv(&self, bufv: IoVectorMut<'_>, offset: u64) -> io::Result<()>;
 
@@ -116,7 +171,7 @@ pub trait Storage: Debug + Display + Send + Sized + Sync {
     /// [`Self::mem_align()`] and [`Self::req_align()`], and safeguards we want to implement for
     /// safe concurrent access may not be available.
     ///
-    /// Use [`StorageExt::writev()`] instead.
+    /// Use [`StorageExt::writev()`](crate::StorageExt::writev()) instead.
     #[allow(async_fn_in_trait)] // No need for Send
     async unsafe fn pure_writev(&self, bufv: IoVector<'_>, offset: u64) -> io::Result<()>;
 
@@ -130,22 +185,27 @@ pub trait Storage: Debug + Display + Send + Sized + Sync {
     /// [`Self::zero_align()`], and safeguards we want to implement for safe concurrent access may
     /// not be available.
     ///
-    /// Use [`StorageExt::write_zeroes()`] instead.
+    /// Use [`StorageExt::write_zeroes()`](crate::StorageExt::write_zeroes()) instead.
     #[allow(async_fn_in_trait)] // No need for Send
-    async unsafe fn pure_write_zeroes(&self, mut offset: u64, mut length: u64) -> io::Result<()> {
-        let buflen = cmp::min(length, 1048576) as usize;
-        let mut buf = IoBuffer::new(buflen, self.mem_align())?;
-        buf.as_mut().into_slice().fill(0);
+    async unsafe fn pure_write_zeroes(&self, offset: u64, length: u64) -> io::Result<()> {
+        ext::write_full_zeroes(self, offset, length).await
+    }
 
-        while length > 0 {
-            let chunk_length = cmp::min(length, 1048576) as usize;
-            self.writev(buf.as_ref_range(0..chunk_length).into(), offset)
-                .await?;
-            offset += chunk_length as u64;
-            length -= chunk_length as u64;
-        }
-
-        Ok(())
+    /// Ensure the given range is allocated, and reads back as zeroes.
+    ///
+    /// The default implementation writes actual zeroes as data, which is inefficient.  Storage
+    /// drivers should override it with a more efficient implementation.
+    ///
+    /// # Safety
+    /// This is a pure write to storage.  The request must be fully aligned to
+    /// [`Self::zero_align()`], and safeguards we want to implement for safe concurrent access may
+    /// not be available.
+    ///
+    /// Use [`StorageExt::write_allocated_zeroes()`](crate::StorageExt::write_allocated_zeroes())
+    /// instead.
+    #[allow(async_fn_in_trait)] // No need for Send
+    async unsafe fn pure_write_allocated_zeroes(&self, offset: u64, length: u64) -> io::Result<()> {
+        ext::write_full_zeroes(self, offset, length).await
     }
 
     /// Discard the given range, with undefined contents when read back.
@@ -160,7 +220,7 @@ pub trait Storage: Debug + Display + Send + Sized + Sync {
     /// [`Self::discard_align()`], and safeguards we want to implement for safe concurrent access
     /// may not be available.
     ///
-    /// Use [`StorageExt::discard()`] instead.
+    /// Use [`StorageExt::discard()`](crate::StorageExt::discard()) instead.
     #[allow(async_fn_in_trait)] // No need for Send
     async unsafe fn pure_discard(&self, _offset: u64, _length: u64) -> io::Result<()> {
         Ok(())
@@ -170,6 +230,9 @@ pub trait Storage: Debug + Display + Send + Sized + Sync {
     ///
     /// Does not necessarily sync those buffers to disk.  When using `flush()`, consider whether
     /// you want to call `sync()` afterwards.
+    ///
+    /// Note that this will not drop the buffers, so they may still be used to serve later
+    /// accesses.  Use [`Storage::invalidate_cache()`] to drop all buffers.
     #[allow(async_fn_in_trait)] // No need for Send
     async fn flush(&self) -> io::Result<()>;
 
@@ -180,8 +243,33 @@ pub trait Storage: Debug + Display + Send + Sized + Sync {
     #[allow(async_fn_in_trait)] // No need for Send
     async fn sync(&self) -> io::Result<()>;
 
-    /// Return the storage helper object (used by the [`StorageExt`] implementation).
+    /// Drop internal buffers.
+    ///
+    /// This drops all internal buffers, but does not flush them!  All cached data is reloaded on
+    /// subsequent accesses.
+    ///
+    /// # Safety
+    /// Not flushing internal buffers may cause corruption.  You must ensure the underlying storage
+    /// state is consistent.
+    #[allow(async_fn_in_trait)] // No need for Send
+    async unsafe fn invalidate_cache(&self) -> io::Result<()>;
+
+    /// Return the storage helper object (used by the [`StorageExt`](crate::StorageExt)
+    /// implementation).
     fn get_storage_helper(&self) -> &CommonStorageHelper;
+
+    /// Resize to the given size.
+    ///
+    /// Set the size of this storage object to `new_size`.  If `new_size` is smaller than the
+    /// current size, ignore `prealloc_mode` and discard the data after `new_size`.
+    ///
+    /// If `new_size` is larger than the current size, `prealloc_mode` determines whether and how
+    /// the new range should be allocated; it is possible some preallocation modes are not
+    /// supported, in which case an [`std::io::ErrorKind::Unsupported`] is returned.
+    #[allow(async_fn_in_trait)] // No need for Send
+    async fn resize(&self, _new_size: u64, _prealloc_mode: PreallocateMode) -> io::Result<()> {
+        Err(io::ErrorKind::Unsupported.into())
+    }
 }
 
 /// Allow dynamic use of storage objects (i.e. is object safe).
@@ -197,7 +285,7 @@ pub trait Storage: Debug + Display + Send + Sized + Sync {
 ///
 /// Async functions in `DynStorage` return boxed futures (`Pin<Box<dyn Future>>`), which makes them
 /// slighly less efficient than async functions in `Storage`, hence the distinction.
-pub trait DynStorage: Debug + Display + Send + Sync {
+pub trait DynStorage: Any + Debug + Display + Send + Sync {
     /// Wrapper around [`Storage::mem_align()`].
     fn dyn_mem_align(&self) -> usize;
 
@@ -215,6 +303,9 @@ pub trait DynStorage: Debug + Display + Send + Sync {
 
     /// Wrapper around [`Storage::resolve_relative_path()`].
     fn dyn_resolve_relative_path(&self, relative: &Path) -> io::Result<PathBuf>;
+
+    /// Wrapper around [`Storage::get_filename()`]
+    fn dyn_get_filename(&self) -> Option<PathBuf>;
 
     /// Object-safe wrapper around [`Storage::pure_readv()`].
     ///
@@ -246,6 +337,16 @@ pub trait DynStorage: Debug + Display + Send + Sync {
         length: u64,
     ) -> Pin<Box<dyn Future<Output = io::Result<()>> + '_>>;
 
+    /// Object-safe wrapper around [`Storage::pure_write_allocated_zeroes()`].
+    ///
+    /// # Safety
+    /// Same considerations are for [`Storage::pure_write_allocated_zeroes()`] apply.
+    unsafe fn dyn_pure_write_allocated_zeroes(
+        &self,
+        offset: u64,
+        length: u64,
+    ) -> Pin<Box<dyn Future<Output = io::Result<()>> + '_>>;
+
     /// Object-safe wrapper around [`Storage::pure_discard()`].
     ///
     /// # Safety
@@ -262,8 +363,50 @@ pub trait DynStorage: Debug + Display + Send + Sync {
     /// Object-safe wrapper around [`Storage::sync()`].
     fn dyn_sync(&self) -> Pin<Box<dyn Future<Output = io::Result<()>> + '_>>;
 
+    /// Object-safe wrapper around [`Storage::invalidate_cache()`].
+    ///
+    /// # Safety
+    /// Same considerations are for [`Storage::invalidate_cache()`] apply.
+    unsafe fn dyn_invalidate_cache(&self) -> Pin<Box<dyn Future<Output = io::Result<()>> + '_>>;
+
     /// Wrapper around [`Storage::get_storage_helper()`].
     fn dyn_get_storage_helper(&self) -> &CommonStorageHelper;
+
+    /// Wrapper around [`Storage::resize()`].
+    fn dyn_resize(
+        &self,
+        new_size: u64,
+        prealloc_mode: PreallocateMode,
+    ) -> Pin<Box<dyn Future<Output = io::Result<()>> + '_>>;
+}
+
+/// Storage object preallocation modes.
+///
+/// When resizing or creating storage objects, this mode determines whether and how the new data
+/// range is to be preallocated.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[non_exhaustive]
+pub enum PreallocateMode {
+    /// No preallocation.
+    ///
+    /// Reading the new range may return random data.
+    None,
+
+    /// Ensure range reads as zeroes.
+    ///
+    /// Does not necessarily allocate data, but has to ensure the new range will read back as
+    /// zeroes.
+    Zero,
+
+    /// Extent preallocation.
+    ///
+    /// Do not write data, but ensure all new extents are allocated.
+    Allocate,
+
+    /// Full data preallocation.
+    ///
+    /// Write zeroes to the whole range.
+    WriteData,
 }
 
 impl<S: Storage> Storage for &S {
@@ -291,6 +434,10 @@ impl<S: Storage> Storage for &S {
         (*self).resolve_relative_path(relative)
     }
 
+    fn get_filename(&self) -> Option<PathBuf> {
+        (*self).get_filename()
+    }
+
     async unsafe fn pure_readv(&self, bufv: IoVectorMut<'_>, offset: u64) -> io::Result<()> {
         unsafe { (*self).pure_readv(bufv, offset).await }
     }
@@ -301,6 +448,10 @@ impl<S: Storage> Storage for &S {
 
     async unsafe fn pure_write_zeroes(&self, offset: u64, length: u64) -> io::Result<()> {
         unsafe { (*self).pure_write_zeroes(offset, length).await }
+    }
+
+    async unsafe fn pure_write_allocated_zeroes(&self, offset: u64, length: u64) -> io::Result<()> {
+        unsafe { (*self).pure_write_allocated_zeroes(offset, length).await }
     }
 
     async unsafe fn pure_discard(&self, offset: u64, length: u64) -> io::Result<()> {
@@ -315,12 +466,20 @@ impl<S: Storage> Storage for &S {
         (*self).sync().await
     }
 
+    async unsafe fn invalidate_cache(&self) -> io::Result<()> {
+        unsafe { (*self).invalidate_cache().await }
+    }
+
     fn get_storage_helper(&self) -> &CommonStorageHelper {
         (*self).get_storage_helper()
     }
+
+    async fn resize(&self, new_size: u64, prealloc_mode: PreallocateMode) -> io::Result<()> {
+        (*self).resize(new_size, prealloc_mode).await
+    }
 }
 
-impl<S: Storage> DynStorage for S {
+impl<S: Storage + 'static> DynStorage for S {
     fn dyn_mem_align(&self) -> usize {
         <S as Storage>::mem_align(self)
     }
@@ -343,6 +502,10 @@ impl<S: Storage> DynStorage for S {
 
     fn dyn_resolve_relative_path(&self, relative: &Path) -> io::Result<PathBuf> {
         <S as Storage>::resolve_relative_path(self, relative)
+    }
+
+    fn dyn_get_filename(&self) -> Option<PathBuf> {
+        <S as Storage>::get_filename(self)
     }
 
     unsafe fn dyn_pure_readv<'a>(
@@ -369,6 +532,14 @@ impl<S: Storage> DynStorage for S {
         Box::pin(unsafe { <S as Storage>::pure_write_zeroes(self, offset, length) })
     }
 
+    unsafe fn dyn_pure_write_allocated_zeroes(
+        &self,
+        offset: u64,
+        length: u64,
+    ) -> Pin<Box<dyn Future<Output = io::Result<()>> + '_>> {
+        Box::pin(unsafe { <S as Storage>::pure_write_allocated_zeroes(self, offset, length) })
+    }
+
     unsafe fn dyn_pure_discard(
         &self,
         offset: u64,
@@ -385,8 +556,20 @@ impl<S: Storage> DynStorage for S {
         Box::pin(<S as Storage>::sync(self))
     }
 
+    unsafe fn dyn_invalidate_cache(&self) -> Pin<Box<dyn Future<Output = io::Result<()>> + '_>> {
+        Box::pin(unsafe { <S as Storage>::invalidate_cache(self) })
+    }
+
     fn dyn_get_storage_helper(&self) -> &CommonStorageHelper {
         <S as Storage>::get_storage_helper(self)
+    }
+
+    fn dyn_resize(
+        &self,
+        new_size: u64,
+        prealloc_mode: PreallocateMode,
+    ) -> Pin<Box<dyn Future<Output = io::Result<()>> + '_>> {
+        Box::pin(<S as Storage>::resize(self, new_size, prealloc_mode))
     }
 }
 
@@ -396,6 +579,11 @@ impl Storage for Box<dyn DynStorage> {
         // given.  Right now, only `File` really supports being opened through options, so it is an
         // obvious choice.
         Ok(Box::new(crate::file::File::open(opts).await?))
+    }
+
+    async fn create_open(opts: StorageCreateOptions) -> io::Result<Self> {
+        // Same as `Self::open()`.
+        Ok(Box::new(crate::file::File::create_open(opts).await?))
     }
 
     fn mem_align(&self) -> usize {
@@ -420,6 +608,10 @@ impl Storage for Box<dyn DynStorage> {
 
     fn resolve_relative_path<P: AsRef<Path>>(&self, relative: P) -> io::Result<PathBuf> {
         self.as_ref().dyn_resolve_relative_path(relative.as_ref())
+    }
+
+    fn get_filename(&self) -> Option<PathBuf> {
+        self.as_ref().dyn_get_filename()
     }
 
     async unsafe fn pure_readv(&self, bufv: IoVectorMut<'_>, offset: u64) -> io::Result<()> {
@@ -434,6 +626,14 @@ impl Storage for Box<dyn DynStorage> {
         unsafe { self.as_ref().dyn_pure_write_zeroes(offset, length).await }
     }
 
+    async unsafe fn pure_write_allocated_zeroes(&self, offset: u64, length: u64) -> io::Result<()> {
+        unsafe {
+            self.as_ref()
+                .dyn_pure_write_allocated_zeroes(offset, length)
+                .await
+        }
+    }
+
     async unsafe fn pure_discard(&self, offset: u64, length: u64) -> io::Result<()> {
         unsafe { self.as_ref().dyn_pure_discard(offset, length).await }
     }
@@ -446,14 +646,28 @@ impl Storage for Box<dyn DynStorage> {
         self.as_ref().dyn_sync().await
     }
 
+    async unsafe fn invalidate_cache(&self) -> io::Result<()> {
+        unsafe { self.as_ref().dyn_invalidate_cache().await }
+    }
+
     fn get_storage_helper(&self) -> &CommonStorageHelper {
         self.as_ref().dyn_get_storage_helper()
+    }
+
+    async fn resize(&self, new_size: u64, prealloc_mode: PreallocateMode) -> io::Result<()> {
+        self.as_ref().dyn_resize(new_size, prealloc_mode).await
     }
 }
 
 impl Storage for Arc<dyn DynStorage> {
     async fn open(opts: StorageOpenOptions) -> io::Result<Self> {
         Box::<dyn DynStorage>::open(opts).await.map(Into::into)
+    }
+
+    async fn create_open(opts: StorageCreateOptions) -> io::Result<Self> {
+        Box::<dyn DynStorage>::create_open(opts)
+            .await
+            .map(Into::into)
     }
 
     fn mem_align(&self) -> usize {
@@ -480,6 +694,10 @@ impl Storage for Arc<dyn DynStorage> {
         self.as_ref().dyn_resolve_relative_path(relative.as_ref())
     }
 
+    fn get_filename(&self) -> Option<PathBuf> {
+        self.as_ref().dyn_get_filename()
+    }
+
     async unsafe fn pure_readv(&self, bufv: IoVectorMut<'_>, offset: u64) -> io::Result<()> {
         unsafe { self.as_ref().dyn_pure_readv(bufv, offset) }.await
     }
@@ -490,6 +708,14 @@ impl Storage for Arc<dyn DynStorage> {
 
     async unsafe fn pure_write_zeroes(&self, offset: u64, length: u64) -> io::Result<()> {
         unsafe { self.as_ref().dyn_pure_write_zeroes(offset, length) }.await
+    }
+
+    async unsafe fn pure_write_allocated_zeroes(&self, offset: u64, length: u64) -> io::Result<()> {
+        unsafe {
+            self.as_ref()
+                .dyn_pure_write_allocated_zeroes(offset, length)
+        }
+        .await
     }
 
     async unsafe fn pure_discard(&self, offset: u64, length: u64) -> io::Result<()> {
@@ -504,8 +730,16 @@ impl Storage for Arc<dyn DynStorage> {
         self.as_ref().dyn_sync().await
     }
 
+    async unsafe fn invalidate_cache(&self) -> io::Result<()> {
+        unsafe { self.as_ref().dyn_invalidate_cache().await }
+    }
+
     fn get_storage_helper(&self) -> &CommonStorageHelper {
         self.as_ref().dyn_get_storage_helper()
+    }
+
+    async fn resize(&self, new_size: u64, prealloc_mode: PreallocateMode) -> io::Result<()> {
+        self.as_ref().dyn_resize(new_size, prealloc_mode).await
     }
 }
 
@@ -531,5 +765,113 @@ impl StorageOpenOptions {
     pub fn direct(mut self, direct: bool) -> Self {
         self.direct = direct;
         self
+    }
+
+    /// macOS-only: whether to use relaxed synchronization on `File`.
+    ///
+    /// If relaxed synchronization is enabled, `File::sync()` will use the `fsync()` syscall
+    /// instead of `fcntl(F_FULLFSYNC)`, which is a lighter synchronization mechanism that flushes
+    /// the filesystem cache to the drive, but doesn't request the drive to flush its internal
+    /// buffers to persistent storage.
+    #[cfg(target_os = "macos")]
+    pub fn relaxed_sync(mut self, relaxed_sync: bool) -> Self {
+        self.relaxed_sync = relaxed_sync;
+        self
+    }
+
+    /// Get the set filename (if any).
+    pub fn get_filename(&self) -> Option<&Path> {
+        self.filename.as_deref()
+    }
+
+    /// Return the set writable state.
+    pub fn get_writable(&self) -> bool {
+        self.writable
+    }
+
+    /// Return the set direct state.
+    pub fn get_direct(&self) -> bool {
+        self.direct
+    }
+
+    /// macOS-only: return the relaxed synchronization state.
+    #[cfg(target_os = "macos")]
+    pub fn get_relaxed_sync(&self) -> bool {
+        self.relaxed_sync
+    }
+}
+
+impl StorageCreateOptions {
+    /// Create default options.
+    pub fn new() -> Self {
+        StorageCreateOptions::default()
+    }
+
+    /// Set the filename of the file to create.
+    pub fn filename<P: AsRef<Path>>(self, filename: P) -> Self {
+        self.modify_open_opts(|o| o.filename(filename))
+    }
+
+    /// Set the initial size.
+    pub fn size(mut self, size: u64) -> Self {
+        self.size = size;
+        self
+    }
+
+    /// Set the desired preallocation mode.
+    pub fn preallocate(mut self, prealloc_mode: PreallocateMode) -> Self {
+        self.prealloc_mode = prealloc_mode;
+        self
+    }
+
+    /// Whether to overwrite an existing file.
+    pub fn overwrite(mut self, overwrite: bool) -> Self {
+        self.overwrite = overwrite;
+        self
+    }
+
+    /// Modify the options used for opening the file.
+    pub fn modify_open_opts<F: FnOnce(StorageOpenOptions) -> StorageOpenOptions>(
+        mut self,
+        f: F,
+    ) -> Self {
+        self.open_opts = f(self.open_opts);
+        self
+    }
+
+    /// Get the set filename (if any).
+    pub fn get_filename(&self) -> Option<&Path> {
+        self.open_opts.filename.as_deref()
+    }
+
+    /// Get the set size.
+    pub fn get_size(&self) -> u64 {
+        self.size
+    }
+
+    /// Get the preallocation mode.
+    pub fn get_preallocate(&self) -> PreallocateMode {
+        self.prealloc_mode
+    }
+
+    /// Check whether to overwrite an existing file.
+    pub fn get_overwrite(&self) -> bool {
+        self.overwrite
+    }
+
+    /// Get the options for opening the created file.
+    pub fn get_open_options(self) -> StorageOpenOptions {
+        self.open_opts
+    }
+}
+
+impl Default for StorageCreateOptions {
+    fn default() -> Self {
+        StorageCreateOptions {
+            open_opts: Default::default(),
+            size: 0,
+            prealloc_mode: PreallocateMode::None,
+            overwrite: false,
+        }
     }
 }

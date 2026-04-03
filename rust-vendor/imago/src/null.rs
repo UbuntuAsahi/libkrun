@@ -4,6 +4,7 @@
 
 use crate::io_buffers::{IoVector, IoVectorMut};
 use crate::storage::drivers::CommonStorageHelper;
+use crate::storage::PreallocateMode;
 use crate::Storage;
 use std::fmt::{self, Display, Formatter};
 use std::io;
@@ -70,8 +71,18 @@ impl Storage for Null {
         Ok(())
     }
 
+    async unsafe fn invalidate_cache(&self) -> io::Result<()> {
+        // Nothing to do, there are no buffers
+        Ok(())
+    }
+
     fn get_storage_helper(&self) -> &CommonStorageHelper {
         &self.common_storage_helper
+    }
+
+    async fn resize(&self, new_size: u64, _prealloc_mode: PreallocateMode) -> io::Result<()> {
+        self.size.store(new_size, Ordering::Relaxed);
+        Ok(())
     }
 }
 

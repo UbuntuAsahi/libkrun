@@ -9,12 +9,10 @@ pub use types::*;
 
 use crate::device::Device;
 use linux::*;
-use rand::{rngs::OsRng, TryRngCore};
 use std::os::fd::{AsRawFd, RawFd};
+use vsock::VMADDR_CID_HOST;
 
 type Result<T> = std::result::Result<T, LaunchError>;
-
-const VMADDR_CID_PARENT: u32 = 3;
 
 /// Facilitates the execution of the nitro enclaves launch process.
 #[derive(Default)]
@@ -28,7 +26,7 @@ impl Launcher {
     /// Begin the nitro enclaves launch process by creating a new enclave VM.
     pub fn new(dev: &Device) -> Result<Self> {
         let mut slot_uid: u64 = 0;
-        let vm_fd = unsafe { libc::ioctl(dev.as_raw_fd(), NE_CREATE_VM as _, &mut slot_uid) };
+        let vm_fd = unsafe { ne_create_vm(dev.as_raw_fd(), &mut slot_uid) }?;
 
         if vm_fd < 0 || slot_uid == 0 {
             return Err(LaunchError::ioctl_err_from_errno());
@@ -58,17 +56,7 @@ impl Launcher {
         let mut load_info = ImageLoadInfo::from(&mem.image_type);
 
         // Get the image offset.
-        let ret = unsafe {
-            libc::ioctl(
-                self.vm_fd.as_raw_fd(),
-                NE_GET_IMAGE_LOAD_INFO as _,
-                &mut load_info,
-            )
-        };
-
-        if ret < 0 {
-            return Err(LaunchError::ioctl_err_from_errno());
-        }
+        unsafe { ne_get_image_load_info(self.vm_fd.as_raw_fd(), &mut load_info) }?;
 
         // Allocate the memory regions from the requested size.
         let mut regions = UserMemoryRegions::new(mem.size_mib).map_err(LaunchError::MemInit)?;
@@ -80,10 +68,7 @@ impl Launcher {
 
         // Add each memory region.
         for r in regions.inner_ref() {
-            let ret = unsafe { libc::ioctl(self.vm_fd, NE_SET_USER_MEMORY_REGION, r) };
-            if ret < 0 {
-                panic!();
-            }
+            unsafe { ne_set_user_memory_region(self.vm_fd, r) }?;
         }
 
         Ok(())
@@ -96,11 +81,7 @@ impl Launcher {
     pub fn add_vcpu(&mut self, id: Option<u32>) -> Result<()> {
         let mut id = id.unwrap_or(0);
 
-        let ret = unsafe { libc::ioctl(self.vm_fd, NE_ADD_VCPU as _, &mut id) };
-
-        if ret < 0 {
-            return Err(LaunchError::ioctl_err_from_errno());
-        }
+        unsafe { ne_add_vcpu(self.vm_fd, &mut id) }?;
 
         self.cpu_ids.push(id);
 
@@ -109,29 +90,23 @@ impl Launcher {
 
     /// Start running an enclave. Supply start flags and optional enclave CID. If successful, will
     /// return the actual enclave's CID (which may be different than the supplied CID).
-    pub fn start(&self, flags: StartFlags, cid: Option<u64>) -> Result<u64> {
-        let mut cid = cid.unwrap_or(0);
+    pub fn start(&self, flags: StartFlags, cid: Option<u32>) -> Result<u64> {
+        let cid = match cid {
+            Some(cid) => {
+                // Ensure that the provided CID is valid.
+                if cid <= VMADDR_CID_HOST || cid == u32::MAX {
+                    return Err(LaunchError::CidInvalid);
+                }
 
-        // Ensure that a valid CID is used. If the current CID is invalid, randomly-generate a
-        // valid one.
-        loop {
-            if cid > VMADDR_CID_PARENT as u64 && cid <= i32::MAX as u64 {
-                break;
+                cid
             }
-
-            cid = OsRng
-                .try_next_u32()
-                .map_err(|_| LaunchError::CidRandomGenerate)? as u64;
-        }
+            None => 0,
+        };
 
         // Start the enclave VM.
-        let mut start_info = StartInfo::new(flags, cid);
+        let mut start_info = StartInfo::new(flags, cid.into());
 
-        let ret = unsafe { libc::ioctl(self.vm_fd, NE_START_ENCLAVE as _, &mut start_info) };
-
-        if ret < 0 {
-            return Err(LaunchError::ioctl_err_from_errno());
-        }
+        unsafe { ne_start_enclave(self.vm_fd, &mut start_info) }?;
 
         Ok(start_info.cid)
     }

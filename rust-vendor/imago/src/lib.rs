@@ -1,5 +1,5 @@
 // #![feature(async_drop)] -- enable with async-drop
-#![cfg_attr(all(doc, nightly), feature(doc_auto_cfg))] // expect nightly for doc
+#![cfg_attr(all(doc, nightly), feature(doc_cfg))] // expect nightly for doc
 #![warn(missing_docs)]
 #![warn(clippy::missing_docs_in_private_items)]
 
@@ -11,12 +11,12 @@
 //! # || -> std::io::Result<()> {
 //! use imago::file::File;
 //! use imago::qcow2::Qcow2;
-//! use imago::SyncFormatAccess;
+//! use imago::{FormatDriverBuilder, PermissiveImplicitOpenGate, SyncFormatAccess};
 //! use std::fs::OpenOptions;
 //!
 //! // Produce read-only qcow2 instance using purely `File` for storage
-//! let mut qcow2 = Qcow2::<File>::open_path_sync("image.qcow2", false)?;
-//! qcow2.open_implicit_dependencies_sync()?;
+//! let mut qcow2 = Qcow2::<File>::builder_path("image.qcow2")
+//!     .open_sync(PermissiveImplicitOpenGate::default())?;
 //!
 //! let qcow2 = SyncFormatAccess::new(qcow2)?;
 //!
@@ -35,26 +35,33 @@
 //! use imago::null::Null;
 //! use imago::qcow2::Qcow2;
 //! use imago::raw::Raw;
-//! use imago::{DynStorage, FormatAccess, Storage, StorageOpenOptions};
+//! use imago::{
+//!     DenyImplicitOpenGate, DynStorage, FormatAccess, FormatDriverBuilder,
+//!     PermissiveImplicitOpenGate, Storage, StorageOpenOptions,
+//! };
 //! use std::sync::Arc;
 //!
-//! let qcow2_file_opts = StorageOpenOptions::new()
-//!     .write(true)
-//!     .filename(String::from("image.qcow2"));
-//! let qcow2_file = File::open(qcow2_file_opts).await?;
-//!
 //! // Produce qcow2 instance with arbitrary (and potentially mixed) storage instances
-//! let mut qcow2 =
-//!     Qcow2::<Box<dyn DynStorage>, Arc<FormatAccess<_>>>::open_image(Box::new(qcow2_file), true)
-//!         .await?;
+//! // (By using `Box<dyn DynStorage>` as the `Storage` type.)
 //!
 //! let backing_storage: Box<dyn DynStorage> = Box::new(Null::new(0));
-//! let backing = Raw::open_image(backing_storage, false).await?;
+//! let backing = Raw::builder(backing_storage)
+//!     .open(DenyImplicitOpenGate::default())
+//!     .await?;
 //! let backing = Arc::new(FormatAccess::new(backing));
-//! qcow2.set_backing(Some(Arc::clone(&backing)));
 //!
-//! // Open potentially remaining dependencies (like an external data file)
-//! qcow2.open_implicit_dependencies().await?;
+//! // `Box<dyn DynStorage>::open()` defaults to using the `imago::file::File` driver, so we can
+//! // use paths with `Box<dyn DynStorage>`, too.
+//! // Despite explicitly setting a backing image, we still need `PermissiveImplicitOpenGate`
+//! // instead of `DenyImplicitOpenGate`, because `builder_path()` will need to implicitly open
+//! // that storage object.  Passing an explicitly opened storage object via `builder()` would
+//! // remedy that.
+//! let qcow2 = Qcow2::builder_path("image.qcow2")
+//!     .storage_open_options(StorageOpenOptions::new().direct(true))
+//!     .write(true)
+//!     .backing(Some(Arc::clone(&backing)))
+//!     .open(PermissiveImplicitOpenGate::default())
+//!     .await?;
 //!
 //! let qcow2 = FormatAccess::new(qcow2);
 //!
@@ -98,9 +105,13 @@ pub mod qcow2;
 pub mod raw;
 pub mod storage;
 mod vector_select;
+pub mod vmdk;
 
-pub use format::access::*;
+pub use format::access::{FormatAccess, Mapping};
+pub use format::builder::{FormatCreateBuilder, FormatDriverBuilder};
+pub use format::drivers::ShallowMapping;
+pub use format::gate::{DenyImplicitOpenGate, PermissiveImplicitOpenGate};
 #[cfg(feature = "sync-wrappers")]
-pub use format::sync_wrappers::*;
+pub use format::sync_wrappers::SyncFormatAccess;
 pub use storage::ext::StorageExt;
-pub use storage::*;
+pub use storage::{DynStorage, Storage, StorageCreateOptions, StorageOpenOptions};

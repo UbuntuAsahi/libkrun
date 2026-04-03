@@ -1,10 +1,8 @@
-diff --git a/Cargo.toml b/Cargo.toml
-index a2ccd033..0a0cdfe5 100644
 --- a/Cargo.toml
 +++ b/Cargo.toml
 @@ -1,6 +1,6 @@
  [workspace]
- members = ["src/libkrun"]
+ members = ["src/libkrun", "src/krun_input"]
 -exclude = ["examples/gtk_display"]
 +exclude = ["examples/gtk_display", "rust-vendor"]
  resolver = "2"

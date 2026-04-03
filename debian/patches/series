@@ -6,3 +6,4 @@
 0006-rutabaga_gfx_virgl_renderer_resource_map_fixed.patch
 0007-cargo_lock_version.patch
 0008-remove-libkrun.pc
+0009-krun_input_rust_edition.patch
