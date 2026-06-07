@@ -1,3 +1,38 @@
+libkrun (1.17.4-1asahi1.26.04) resolute; urgency=medium
+
+  * Build for resolute
+  * Based on tag v1.17.4
+
+ -- Andreas Schröder <andreas@kernelpanik.net>  Fri, 3 Apr 2026 22:53:00 +0200
+
+libkrun (1.17.4-1asahi1.25.10) questing; urgency=medium
+
+  * Build for questing
+  * Based on tag v1.17.4
+
+ -- Andreas Schröder <andreas@kernelpanik.net>  Fri, 3 Apr 2026 22:35:00 +0200
+
+libkrun (1.17.4-1asahi2.24.04) noble; urgency=medium
+
+  * Build for noble
+  * Based on tag v1.17.4
+
+ -- Andreas Schröder <andreas@kernelpanik.net>  Fri, 3 Apr 2026 18:38:00 +0200
+
+libkrun (1.17.2-1asahi1.25.10) questing; urgency=medium
+
+  * Build for questing
+  * Based on tag v1.17.2
+
+ -- Andreas Schröder <andreas@kernelpanik.net>  Sun, 8 Feb 2026 08:49:00 +0100
+
+libkrun (1.17.2-1asahi1.24.04) noble; urgency=medium
+
+  * Build for noble
+  * Based on tag v1.17.2
+
+ -- Andreas Schröder <andreas@kernelpanik.net>  Sat, 7 Feb 2026 23:22:00 +0100
+
 libkrun (1.15.1-1asahi1.25.10) questing; urgency=medium
 
   * Build for questing

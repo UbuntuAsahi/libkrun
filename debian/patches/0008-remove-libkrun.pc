@@ -1,7 +1,16 @@
 --- a/Makefile
 +++ b/Makefile
-@@ -110,7 +110,7 @@
-     PREFIX := /usr/local
+@@ -103,14 +103,14 @@
+ LIBRARY_RELEASE_Darwin = target/release/$(KRUN_BINARY_Darwin)
+ LIBRARY_DEBUG_Darwin = target/debug/$(KRUN_BINARY_Darwin)
+ 
+-LIBDIR_Linux = lib64
++LIBDIR_Linux = lib/aarch64-linux-gnu
+ LIBDIR_Darwin = lib
+ 
+ ifeq ($(PREFIX),)
+-    PREFIX := /usr/local
++    PREFIX := /usr
  endif
  
 -.PHONY: install clean test test-prefix $(LIBRARY_RELEASE_$(OS)) $(LIBRARY_DEBUG_$(OS)) libkrun.pc clean-sysroot clean-all

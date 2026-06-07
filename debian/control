@@ -14,6 +14,7 @@ Build-Depends:
  libssl-dev,
  libelf-dev,
  libudev-dev,
+ libcap-ng-dev,
  autoconf,
  bc,
  cpio,
