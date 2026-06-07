@@ -14,7 +14,7 @@
 use std::fmt;
 use std::io::{Read, Seek, SeekFrom};
 
-use vm_memory::{Address, ByteValued, GuestAddress, GuestMemory, GuestUsize, ReadVolatile};
+use vm_memory::{Address, ByteValued, Bytes, GuestAddress, GuestMemory, GuestUsize, ReadVolatile};
 
 use crate::loader::{Error as KernelLoaderError, KernelLoader, KernelLoaderResult, Result};
 
@@ -73,19 +73,20 @@ impl std::error::Error for Error {}
 #[cfg(target_arch = "aarch64")]
 #[repr(C)]
 #[derive(Debug, Copy, Clone, Default)]
+#[allow(missing_docs)]
 // See kernel doc Documentation/arm64/booting.txt for more information.
 // All these fields should be little endian.
-struct arm64_image_header {
-    code0: u32,
-    code1: u32,
-    text_offset: u64,
-    image_size: u64,
-    flags: u64,
-    res2: u64,
-    res3: u64,
-    res4: u64,
-    magic: u32,
-    res5: u32,
+pub struct arm64_image_header {
+    pub code0: u32,
+    pub code1: u32,
+    pub text_offset: u64,
+    pub image_size: u64,
+    pub flags: u64,
+    pub res2: u64,
+    pub res3: u64,
+    pub res4: u64,
+    pub magic: u32,
+    pub res5: u32,
 }
 
 #[cfg(target_arch = "aarch64")]
@@ -96,20 +97,21 @@ unsafe impl ByteValued for arm64_image_header {}
 #[cfg(target_arch = "riscv64")]
 #[repr(C)]
 #[derive(Debug, Copy, Clone, Default)]
+#[allow(missing_docs)]
 // See kernel doc Documentation/arch/riscv/boot-image-header.rst
 // All these fields should be little endian.
-struct riscv64_image_header {
-    code0: u32,
-    code1: u32,
-    text_offset: u64,
-    image_size: u64,
-    flags: u64,
-    version: u32,
-    res1: u32,
-    res2: u64,
-    magic: u64,
-    magic2: u32,
-    res3: u32,
+pub struct riscv64_image_header {
+    pub code0: u32,
+    pub code1: u32,
+    pub text_offset: u64,
+    pub image_size: u64,
+    pub flags: u64,
+    pub version: u32,
+    pub res1: u32,
+    pub res2: u64,
+    pub magic: u64,
+    pub magic2: u32,
+    pub res3: u32,
 }
 
 #[cfg(target_arch = "riscv64")]

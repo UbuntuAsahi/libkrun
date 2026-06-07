@@ -19,6 +19,7 @@ use std::sync::atomic::Ordering;
 
 use crate::atomic_integer::AtomicInteger;
 use crate::volatile_memory::VolatileSlice;
+use crate::{ReadVolatile, WriteVolatile};
 
 /// Types for which it is safe to initialize from raw data.
 ///
@@ -113,16 +114,27 @@ pub unsafe trait ByteValued: Copy + Send + Sync {
 
     /// Converts a mutable reference to `self` into a `VolatileSlice`.  This is
     /// useful because `VolatileSlice` provides a `Bytes<usize>` implementation.
-    ///
-    /// # Safety
-    ///
-    /// Unlike most `VolatileMemory` implementation, this method requires an exclusive
-    /// reference to `self`; this trivially fulfills `VolatileSlice::new`'s requirement
-    /// that all accesses to `self` use volatile accesses (because there can
-    /// be no other accesses).
     fn as_bytes(&mut self) -> VolatileSlice {
-        // SAFETY: This is safe because the lifetime is the same as self
-        unsafe { VolatileSlice::new(self as *mut Self as *mut _, size_of::<Self>()) }
+        VolatileSlice::from(self.as_mut_slice())
+    }
+
+    /// Constructs a `Self` ewhose binary representation is set to all zeroes.
+    fn zeroed() -> Self {
+        // SAFETY: ByteValued objects must be assignable from arbitrary byte
+        // sequences and are mandated to be packed.
+        // Hence, zeroed memory is a fine initialization.
+        unsafe { MaybeUninit::<Self>::zeroed().assume_init() }
+    }
+
+    /// Writes this [`ByteValued`]'s byte representation to the given [`Write`] impl.
+    fn write_all_to<W: Write>(&self, mut writer: W) -> Result<(), std::io::Error> {
+        writer.write_all(self.as_slice())
+    }
+
+    /// Constructs an instance of this [`ByteValued`] by reading from the given [`Read`] impl.
+    fn read_exact_from<R: Read>(mut reader: R) -> Result<Self, std::io::Error> {
+        let mut result = Self::zeroed();
+        reader.read_exact(result.as_mut_slice()).map(|_| result)
     }
 }
 
@@ -227,15 +239,41 @@ pub trait Bytes<A> {
     /// Returns the number of bytes written. The number of bytes written can
     /// be less than the length of the slice if there isn't enough room in the
     /// container.
+    ///
+    /// If the given slice is empty (e.g. has length 0), always returns `Ok(0)`, even if `addr`
+    /// is otherwise out of bounds. However, if the container is empty, it will
+    /// return an error (unless the slice is also empty, in which case the above takes precedence).
+    ///
+    /// ```rust
+    /// # use vm_memory::{Bytes, VolatileMemoryError, VolatileSlice};
+    /// # use matches::assert_matches;
+    /// let mut arr = [1, 2, 3, 4, 5];
+    /// let slice = VolatileSlice::from(arr.as_mut_slice());
+    ///
+    /// assert_eq!(slice.write(&[1, 2, 3], 0).unwrap(), 3);
+    /// assert_eq!(slice.write(&[1, 2, 3], 3).unwrap(), 2);
+    /// assert_matches!(
+    ///     slice.write(&[1, 2, 3], 5).unwrap_err(),
+    ///     VolatileMemoryError::OutOfBounds { addr: 5 }
+    /// );
+    /// assert_eq!(slice.write(&[], 5).unwrap(), 0);
+    /// ```
     fn write(&self, buf: &[u8], addr: A) -> Result<usize, Self::E>;
 
     /// Reads data from the container at `addr` into a slice.
     ///
     /// Returns the number of bytes read. The number of bytes read can be less than the length
     /// of the slice if there isn't enough data within the container.
+    ///
+    /// If the given slice is empty (e.g. has length 0), always returns `Ok(0)`, even if `addr`
+    /// is otherwise out of bounds. However, if the container is empty, it will
+    /// return an error (unless the slice is also empty, in which case the above takes precedence).
     fn read(&self, buf: &mut [u8], addr: A) -> Result<usize, Self::E>;
 
     /// Writes the entire content of a slice into the container at `addr`.
+    ///
+    /// If the given slice is empty (e.g. has length 0), always returns `Ok(0)`, even if `addr`
+    /// is otherwise out of bounds.
     ///
     /// # Errors
     ///
@@ -244,6 +282,9 @@ pub trait Bytes<A> {
     fn write_slice(&self, buf: &[u8], addr: A) -> Result<(), Self::E>;
 
     /// Reads data from the container at `addr` to fill an entire slice.
+    ///
+    /// If the given slice is empty (e.g. has length 0), always returns `Ok(0)`, even if `addr`
+    /// is otherwise out of bounds.
     ///
     /// # Errors
     ///
@@ -270,14 +311,13 @@ pub trait Bytes<A> {
     ///
     /// Returns an error if there's not enough data inside the container.
     fn read_obj<T: ByteValued>(&self, addr: A) -> Result<T, Self::E> {
-        // SAFETY: ByteValued objects must be assignable from a arbitrary byte
-        // sequence and are mandated to be packed.
-        // Hence, zeroed memory is a fine initialization.
-        let mut result: T = unsafe { MaybeUninit::<T>::zeroed().assume_init() };
+        let mut result = T::zeroed();
         self.read_slice(result.as_mut_slice(), addr).map(|_| result)
     }
 
-    /// Reads up to `count` bytes from an object and writes them into the container at `addr`.
+    /// Reads up to `count` bytes from `src` and writes them into the container at `addr`.
+    /// Unlike `VolatileRead::read_volatile`, this function retries on `EINTR` being returned from
+    /// the underlying I/O `read` operation.
     ///
     /// Returns the number of bytes written into the container.
     ///
@@ -285,12 +325,42 @@ pub trait Bytes<A> {
     /// * `addr` - Begin writing at this address.
     /// * `src` - Copy from `src` into the container.
     /// * `count` - Copy `count` bytes from `src` into the container.
-    #[deprecated(
-        note = "Use `.read_volatile_from` or the functions of the `ReadVolatile` trait instead"
-    )]
-    fn read_from<F>(&self, addr: A, src: &mut F, count: usize) -> Result<usize, Self::E>
+    ///
+    /// # Examples
+    ///
+    /// * Read bytes from /dev/urandom (uses the `backend-mmap` feature)
+    ///
+    /// ```
+    /// # #[cfg(all(feature = "backend-mmap", feature = "rawfd"))]
+    /// # {
+    /// # use vm_memory::{Address, GuestMemory, Bytes, GuestAddress, GuestMemoryMmap};
+    /// # use std::fs::File;
+    /// # use std::path::Path;
+    /// #
+    /// # let start_addr = GuestAddress(0x1000);
+    /// # let gm = GuestMemoryMmap::<()>::from_ranges(&vec![(start_addr, 0x400)])
+    /// #    .expect("Could not create guest memory");
+    /// # let addr = GuestAddress(0x1010);
+    /// # let mut file = if cfg!(target_family = "unix") {
+    /// let mut file = File::open(Path::new("/dev/urandom")).expect("Could not open /dev/urandom");
+    /// #   file
+    /// # } else {
+    /// #   File::open(Path::new("c:\\Windows\\system32\\ntoskrnl.exe"))
+    /// #       .expect("Could not open c:\\Windows\\system32\\ntoskrnl.exe")
+    /// # };
+    ///
+    /// gm.read_volatile_from(addr, &mut file, 128)
+    ///     .expect("Could not read from /dev/urandom into guest memory");
+    ///
+    /// let read_addr = addr.checked_add(8).expect("Could not compute read address");
+    /// let rand_val: u32 = gm
+    ///     .read_obj(read_addr)
+    ///     .expect("Could not read u32 val from /dev/urandom");
+    /// # }
+    /// ```
+    fn read_volatile_from<F>(&self, addr: A, src: &mut F, count: usize) -> Result<usize, Self::E>
     where
-        F: Read;
+        F: ReadVolatile;
 
     /// Reads exactly `count` bytes from an object and writes them into the container at `addr`.
     ///
@@ -303,14 +373,18 @@ pub trait Bytes<A> {
     /// * `addr` - Begin writing at this address.
     /// * `src` - Copy from `src` into the container.
     /// * `count` - Copy exactly `count` bytes from `src` into the container.
-    #[deprecated(
-        note = "Use `.read_exact_volatile_from` or the functions of the `ReadVolatile` trait instead"
-    )]
-    fn read_exact_from<F>(&self, addr: A, src: &mut F, count: usize) -> Result<(), Self::E>
+    fn read_exact_volatile_from<F>(
+        &self,
+        addr: A,
+        src: &mut F,
+        count: usize,
+    ) -> Result<(), Self::E>
     where
-        F: Read;
+        F: ReadVolatile;
 
-    /// Reads up to `count` bytes from the container at `addr` and writes them it into an object.
+    /// Reads up to `count` bytes from the container at `addr` and writes them into `dst`.
+    /// Unlike `VolatileWrite::write_volatile`, this function retries on `EINTR` being returned by
+    /// the underlying I/O `write` operation.
     ///
     /// Returns the number of bytes written into the object.
     ///
@@ -318,12 +392,9 @@ pub trait Bytes<A> {
     /// * `addr` - Begin reading from this address.
     /// * `dst` - Copy from the container to `dst`.
     /// * `count` - Copy `count` bytes from the container to `dst`.
-    #[deprecated(
-        note = "Use `.write_volatile_to` or the functions of the `WriteVolatile` trait instead"
-    )]
-    fn write_to<F>(&self, addr: A, dst: &mut F, count: usize) -> Result<usize, Self::E>
+    fn write_volatile_to<F>(&self, addr: A, dst: &mut F, count: usize) -> Result<usize, Self::E>
     where
-        F: Write;
+        F: WriteVolatile;
 
     /// Reads exactly `count` bytes from the container at `addr` and writes them into an object.
     ///
@@ -336,12 +407,9 @@ pub trait Bytes<A> {
     /// * `addr` - Begin reading from this address.
     /// * `dst` - Copy from the container to `dst`.
     /// * `count` - Copy exactly `count` bytes from the container to `dst`.
-    #[deprecated(
-        note = "Use `.write_all_volatile_to` or the functions of the `WriteVolatile` trait instead"
-    )]
-    fn write_all_to<F>(&self, addr: A, dst: &mut F, count: usize) -> Result<(), Self::E>
+    fn write_all_volatile_to<F>(&self, addr: A, dst: &mut F, count: usize) -> Result<(), Self::E>
     where
-        F: Write;
+        F: WriteVolatile;
 
     /// Atomically store a value at the specified address.
     fn store<T: AtomicAccess>(&self, val: T, addr: A, order: Ordering) -> Result<(), Self::E>;
@@ -357,6 +425,7 @@ pub(crate) mod tests {
 
     use std::cell::RefCell;
     use std::fmt::Debug;
+    use std::io::ErrorKind;
     use std::mem::align_of;
 
     // Helper method to test atomic accesses for a given `b: Bytes` that's supposed to be
@@ -481,30 +550,50 @@ pub(crate) mod tests {
             Ok(())
         }
 
-        fn read_from<F>(&self, _: usize, _: &mut F, _: usize) -> Result<usize, Self::E>
+        fn read_volatile_from<F>(
+            &self,
+            _addr: usize,
+            _src: &mut F,
+            _count: usize,
+        ) -> Result<usize, Self::E>
         where
-            F: Read,
+            F: ReadVolatile,
         {
             unimplemented!()
         }
 
-        fn read_exact_from<F>(&self, _: usize, _: &mut F, _: usize) -> Result<(), Self::E>
+        fn read_exact_volatile_from<F>(
+            &self,
+            _addr: usize,
+            _src: &mut F,
+            _count: usize,
+        ) -> Result<(), Self::E>
         where
-            F: Read,
+            F: ReadVolatile,
         {
             unimplemented!()
         }
 
-        fn write_to<F>(&self, _: usize, _: &mut F, _: usize) -> Result<usize, Self::E>
+        fn write_volatile_to<F>(
+            &self,
+            _addr: usize,
+            _dst: &mut F,
+            _count: usize,
+        ) -> Result<usize, Self::E>
         where
-            F: Write,
+            F: WriteVolatile,
         {
             unimplemented!()
         }
 
-        fn write_all_to<F>(&self, _: usize, _: &mut F, _: usize) -> Result<(), Self::E>
+        fn write_all_volatile_to<F>(
+            &self,
+            _addr: usize,
+            _dst: &mut F,
+            _count: usize,
+        ) -> Result<(), Self::E>
         where
-            F: Write,
+            F: WriteVolatile,
         {
             unimplemented!()
         }
@@ -537,7 +626,7 @@ pub(crate) mod tests {
     }
 
     #[repr(C)]
-    #[derive(Copy, Clone, Default)]
+    #[derive(Copy, Clone, Default, Debug)]
     struct S {
         a: u32,
         b: u32,
@@ -552,5 +641,32 @@ pub(crate) mod tests {
         s.as_bytes().copy_from(&a);
         assert_eq!(s.a, 0);
         assert_eq!(s.b, 0x0101_0101);
+    }
+
+    #[test]
+    fn test_byte_valued_io() {
+        let a: [u8; 8] = [0, 0, 0, 0, 1, 1, 1, 1];
+
+        let result = S::read_exact_from(&a[1..]);
+        assert_eq!(result.unwrap_err().kind(), ErrorKind::UnexpectedEof);
+
+        let s = S::read_exact_from(&a[..]).unwrap();
+        assert_eq!(s.a, 0);
+        assert_eq!(s.b, 0x0101_0101);
+
+        let mut b = Vec::new();
+        s.write_all_to(&mut b).unwrap();
+        assert_eq!(a.as_ref(), b.as_slice());
+
+        let mut b = [0; 7];
+        let result = s.write_all_to(b.as_mut_slice());
+        assert_eq!(result.unwrap_err().kind(), ErrorKind::WriteZero);
+    }
+
+    #[test]
+    fn test_byte_valued_zeroed() {
+        let s = S::zeroed();
+
+        assert!(s.as_slice().iter().all(|&b| b == 0x0));
     }
 }

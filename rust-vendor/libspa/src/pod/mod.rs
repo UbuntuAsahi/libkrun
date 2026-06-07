@@ -17,6 +17,7 @@ use std::{
     io::{Seek, Write},
     mem::MaybeUninit,
     os::fd::RawFd,
+    ptr::addr_of,
 };
 
 use bitflags::bitflags;
@@ -33,7 +34,7 @@ use nom::{
         complete::{f32, f64, i32, i64, u32},
         Endianness,
     },
-    IResult,
+    IResult, Parser,
 };
 
 use deserialize::{BoolVisitor, NoneVisitor, PodDeserialize, PodDeserializer};
@@ -89,7 +90,18 @@ impl Pod {
     }
 
     pub fn as_raw_ptr(&self) -> *mut spa_sys::spa_pod {
-        std::ptr::addr_of!(self.0).cast_mut()
+        addr_of!(self.0).cast_mut()
+    }
+
+    /// Returns a pointer to the pods body.
+    ///
+    /// If the pod has an empty body, this can be outside the pods allocation.
+    pub fn body(&self) -> *mut c_void {
+        unsafe {
+            self.as_raw_ptr()
+                .byte_add(std::mem::size_of::<spa_sys::spa_pod>())
+                .cast()
+        }
     }
 
     /// Construct a pod from raw bytes.
@@ -158,7 +170,7 @@ impl Pod {
             if res >= 0 {
                 Ok(b.assume_init())
             } else {
-                Err(Errno::from_i32(-res))
+                Err(Errno::from_raw(-res))
             }
         }
     }
@@ -176,7 +188,7 @@ impl Pod {
             if res >= 0 {
                 Ok(Id(id.assume_init()))
             } else {
-                Err(Errno::from_i32(-res))
+                Err(Errno::from_raw(-res))
             }
         }
     }
@@ -194,7 +206,7 @@ impl Pod {
             if res >= 0 {
                 Ok(int.assume_init())
             } else {
-                Err(Errno::from_i32(-res))
+                Err(Errno::from_raw(-res))
             }
         }
     }
@@ -212,7 +224,7 @@ impl Pod {
             if res >= 0 {
                 Ok(long.assume_init())
             } else {
-                Err(Errno::from_i32(-res))
+                Err(Errno::from_raw(-res))
             }
         }
     }
@@ -230,7 +242,7 @@ impl Pod {
             if res >= 0 {
                 Ok(float.assume_init())
             } else {
-                Err(Errno::from_i32(-res))
+                Err(Errno::from_raw(-res))
             }
         }
     }
@@ -248,7 +260,7 @@ impl Pod {
             if res >= 0 {
                 Ok(double.assume_init())
             } else {
-                Err(Errno::from_i32(-res))
+                Err(Errno::from_raw(-res))
             }
         }
     }
@@ -278,7 +290,7 @@ impl Pod {
                 let bytes = std::slice::from_raw_parts(bytes.cast(), len.try_into().unwrap());
                 Ok(bytes)
             } else {
-                Err(Errno::from_i32(-res))
+                Err(Errno::from_raw(-res))
             }
         }
     }
@@ -303,7 +315,7 @@ impl Pod {
                 let pointer = pointer.assume_init();
                 Ok((pointer, _type))
             } else {
-                Err(Errno::from_i32(-res))
+                Err(Errno::from_raw(-res))
             }
         }
     }
@@ -323,7 +335,7 @@ impl Pod {
                 let fd: RawFd = fd.try_into().unwrap();
                 Ok(fd)
             } else {
-                Err(Errno::from_i32(-res))
+                Err(Errno::from_raw(-res))
             }
         }
     }
@@ -341,7 +353,7 @@ impl Pod {
             if res >= 0 {
                 Ok(rectangle.assume_init())
             } else {
-                Err(Errno::from_i32(-res))
+                Err(Errno::from_raw(-res))
             }
         }
     }
@@ -359,7 +371,7 @@ impl Pod {
             if res >= 0 {
                 Ok(fraction.assume_init())
             } else {
-                Err(Errno::from_i32(-res))
+                Err(Errno::from_raw(-res))
             }
         }
     }
@@ -384,14 +396,321 @@ impl Pod {
         res != 0
     }
 
+    pub fn as_struct(&self) -> Result<&PodStruct, Errno> {
+        if self.is_struct() {
+            // Safety: We already know that the pod is valid, and since it is a struct, we can
+            //         safely create a PodStruct from it
+            Ok(unsafe { PodStruct::from_raw(self.as_raw_ptr() as *const spa_sys::spa_pod_struct) })
+        } else {
+            Err(Errno::EINVAL)
+        }
+    }
+
     pub fn is_object(&self) -> bool {
         let res = unsafe { spa_sys::spa_pod_is_object(self.as_raw_ptr()) };
         res != 0
     }
 
+    // TODO: spa_pod_is_object_type, spa_pod_is_object_id
+
+    pub fn as_object(&self) -> Result<&PodObject, Errno> {
+        if self.is_object() {
+            // Safety: We already know that the pod is valid, and since it is an object, we can
+            //         safely create a PodObject from it
+            Ok(unsafe { PodObject::from_raw(self.as_raw_ptr() as *const spa_sys::spa_pod_object) })
+        } else {
+            Err(Errno::EINVAL)
+        }
+    }
+
     pub fn is_sequence(&self) -> bool {
         let res = unsafe { spa_sys::spa_pod_is_sequence(self.as_raw_ptr()) };
         res != 0
+    }
+}
+
+impl<'p> From<&'p PodStruct> for &'p Pod {
+    fn from(value: &'p PodStruct) -> Self {
+        value.as_pod()
+    }
+}
+
+impl<'p> From<&'p PodObject> for &'p Pod {
+    fn from(value: &'p PodObject) -> Self {
+        value.as_pod()
+    }
+}
+
+/// A transparent wrapper around a `spa_sys::spa_pod_struct`.
+#[repr(transparent)]
+pub struct PodStruct(spa_sys::spa_pod_struct);
+
+impl PodStruct {
+    /// # Safety
+    ///
+    /// The provided pointer must point to a valid, well-aligned pod of type struct.
+    ///
+    /// All restrictions from [`Pod::from_raw`] also apply here.
+    pub unsafe fn from_raw(pod: *const spa_sys::spa_pod_struct) -> &'static Self {
+        pod.cast::<Self>().as_ref().unwrap()
+    }
+
+    /// # Safety
+    ///
+    /// The provided pointer must point to a valid, well-aligned pod of type struct.
+    ///
+    /// All restrictions from [`Pod::from_raw_mut`] also apply here.
+    pub unsafe fn from_raw_mut(pod: *mut spa_sys::spa_pod_struct) -> &'static mut Self {
+        pod.cast::<Self>().as_mut().unwrap()
+    }
+
+    pub fn as_raw_ptr(&self) -> *mut spa_sys::spa_pod_struct {
+        std::ptr::addr_of!(self.0).cast_mut()
+    }
+
+    pub fn as_pod(&self) -> &Pod {
+        // Safety: Since this is a valid spa_pod_object, it must also be a valid spa_pod
+        unsafe { Pod::from_raw(addr_of!(self.0.pod)) }
+    }
+
+    pub fn fields(&self) -> PodStructIter<'_> {
+        PodStructIter::new(self)
+    }
+}
+
+impl<'p> TryFrom<&'p Pod> for &'p PodStruct {
+    type Error = Errno;
+
+    fn try_from(value: &'p Pod) -> Result<Self, Self::Error> {
+        value.as_struct()
+    }
+}
+
+impl AsRef<Pod> for PodStruct {
+    fn as_ref(&self) -> &Pod {
+        self.as_pod()
+    }
+}
+
+pub struct PodStructIter<'s> {
+    struct_pod: &'s PodStruct,
+    next: *mut c_void,
+}
+
+impl<'s> PodStructIter<'s> {
+    fn new(struct_pod: &'s PodStruct) -> Self {
+        let first_field = struct_pod.as_pod().body();
+
+        Self {
+            struct_pod,
+            next: first_field,
+        }
+    }
+}
+
+impl<'s> Iterator for PodStructIter<'s> {
+    type Item = &'s Pod;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        // Check if the iterator has at least one element left that we can return
+        let has_next = unsafe {
+            spa_sys::spa_pod_is_inside(
+                self.struct_pod.as_pod().body(),
+                self.struct_pod.0.pod.size,
+                self.next,
+            )
+        };
+
+        if has_next {
+            let res = unsafe { Pod::from_raw(self.next as *const spa_sys::spa_pod) };
+
+            // Advance iter to next property
+            self.next = unsafe { spa_sys::spa_pod_next(self.next) };
+
+            Some(res)
+        } else {
+            None
+        }
+    }
+}
+
+/// A transparent wrapper around a `spa_sys::spa_pod_object`.
+#[repr(transparent)]
+pub struct PodObject(spa_sys::spa_pod_object);
+
+impl PodObject {
+    /// # Safety
+    ///
+    /// The provided pointer must point to a valid, well-aligned pod of type object.
+    ///
+    /// All restrictions from [`Pod::from_raw`] also apply here.
+    pub unsafe fn from_raw(pod: *const spa_sys::spa_pod_object) -> &'static Self {
+        pod.cast::<Self>().as_ref().unwrap()
+    }
+
+    /// # Safety
+    ///
+    /// The provided pointer must point to a valid, well-aligned pod of type object.
+    ///
+    /// All restrictions from [`Pod::from_raw_mut`] also apply here.
+    pub unsafe fn from_raw_mut(pod: *mut spa_sys::spa_pod_object) -> &'static mut Self {
+        pod.cast::<Self>().as_mut().unwrap()
+    }
+
+    pub fn as_raw_ptr(&self) -> *mut spa_sys::spa_pod_object {
+        std::ptr::addr_of!(self.0).cast_mut()
+    }
+
+    pub fn as_pod(&self) -> &Pod {
+        // Safety: Since this is a valid spa_pod_object, it must also be a valid spa_pod
+        unsafe { Pod::from_raw(addr_of!(self.0.pod)) }
+    }
+
+    pub fn type_(&self) -> SpaTypes {
+        SpaTypes::from_raw(self.0.body.type_)
+    }
+
+    pub fn id(&self) -> Id {
+        Id(self.0.body.id)
+    }
+
+    pub fn props(&self) -> PodObjectIter<'_> {
+        PodObjectIter::new(self)
+    }
+
+    pub fn find_prop(&self, /* TODO: start, */ key: Id) -> Option<&PodProp> {
+        let prop = unsafe {
+            spa_sys::spa_pod_object_find_prop(self.as_raw_ptr(), std::ptr::null(), key.0)
+        };
+
+        if !prop.is_null() {
+            unsafe { Some(PodProp::from_raw(prop)) }
+        } else {
+            None
+        }
+    }
+
+    pub fn fixate(&mut self) {
+        let _res = unsafe { spa_sys::spa_pod_object_fixate(self.as_raw_ptr()) };
+        // C implementation always returns 0
+    }
+
+    #[cfg(feature = "v0_3_40")]
+    pub fn is_fixated(&self) -> bool {
+        let res = unsafe { spa_sys::spa_pod_object_is_fixated(self.as_raw_ptr()) };
+        res != 0
+    }
+}
+
+impl<'p> TryFrom<&'p Pod> for &'p PodObject {
+    type Error = Errno;
+
+    fn try_from(value: &'p Pod) -> Result<Self, Self::Error> {
+        value.as_object()
+    }
+}
+
+impl AsRef<Pod> for PodObject {
+    fn as_ref(&self) -> &Pod {
+        self.as_pod()
+    }
+}
+
+pub struct PodObjectIter<'o> {
+    object: &'o PodObject,
+    next: *mut spa_sys::spa_pod_prop,
+}
+
+impl<'o> PodObjectIter<'o> {
+    fn new(object: &'o PodObject) -> Self {
+        let first_prop = unsafe { spa_sys::spa_pod_prop_first(addr_of!(object.0.body)) };
+
+        Self {
+            object,
+            next: first_prop,
+        }
+    }
+}
+
+impl<'o> Iterator for PodObjectIter<'o> {
+    type Item = &'o PodProp;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        // Check if the iterator has at least one element left that we can return
+        let has_next = unsafe {
+            spa_sys::spa_pod_prop_is_inside(
+                addr_of!(self.object.0.body),
+                self.object.0.pod.size,
+                self.next,
+            )
+        };
+
+        if has_next {
+            let res = unsafe { PodProp::from_raw(self.next.cast_const()) };
+
+            // Advance iter to next property
+            self.next = unsafe { spa_sys::spa_pod_prop_next(self.next) };
+
+            Some(res)
+        } else {
+            None
+        }
+    }
+}
+
+bitflags! {
+    #[derive(Debug, PartialEq, Eq, Clone, Copy)]
+    pub struct PodPropFlags: u32 {
+        const READONLY = spa_sys::SPA_POD_PROP_FLAG_READONLY;
+        const HARDWARE = spa_sys::SPA_POD_PROP_FLAG_HARDWARE;
+        const HINT_DICT = spa_sys::SPA_POD_PROP_FLAG_HINT_DICT;
+        const MANDATORY = spa_sys::SPA_POD_PROP_FLAG_MANDATORY;
+        const DONT_FIXATE = spa_sys::SPA_POD_PROP_FLAG_DONT_FIXATE;
+    }
+}
+
+/// A transparent wrapper around a `spa_sys::spa_pod_prop`.
+#[repr(transparent)]
+pub struct PodProp(spa_sys::spa_pod_prop);
+
+impl PodProp {
+    /// # Safety
+    ///
+    /// The provided pointer must point to a valid, well-aligned [`spa_sys::spa_pod_prop`].
+    ///
+    /// While this struct doesn't represent a full pod, all restrictions from [`Pod::from_raw`] also apply
+    /// to this struct and the contained `value` pod.
+    pub unsafe fn from_raw(prop: *const spa_sys::spa_pod_prop) -> &'static Self {
+        prop.cast::<Self>().as_ref().unwrap()
+    }
+
+    /// # Safety
+    ///
+    /// The provided pointer must point to a valid, well-aligned pod of type object.
+    ///
+    /// While this struct doesn't represent a full pod, all restrictions from [`Pod::from_raw`] also apply
+    /// to this struct and the contained `value` pod.
+    pub unsafe fn from_raw_mut(prop: *mut spa_sys::spa_pod_prop) -> &'static mut Self {
+        prop.cast::<Self>().as_mut().unwrap()
+    }
+
+    pub fn as_raw_ptr(&self) -> *mut spa_sys::spa_pod_prop {
+        std::ptr::addr_of!(self.0).cast_mut()
+    }
+
+    pub fn key(&self) -> Id {
+        Id(self.0.key)
+    }
+
+    pub fn flags(&self) -> PodPropFlags {
+        PodPropFlags::from_bits_retain(self.0.flags)
+    }
+
+    pub fn value(&self) -> &Pod {
+        // Safety: Since PodProp may only be constructed around valid Pods, the contained value must also be valid.
+        //         We don't mutate the pod and neither can the returned reference.
+        //         The returned lifetime is properly shortened by this methods signature.
+        unsafe { Pod::from_raw(addr_of!(self.0.value)) }
     }
 }
 
@@ -478,7 +797,7 @@ impl CanonicalFixedSizedPod for bool {
     where
         Self: Sized,
     {
-        map(u32(Endianness::Native), |b| b != 0)(input)
+        map(u32(Endianness::Native), |b| b != 0).parse(input)
     }
 }
 
@@ -566,7 +885,8 @@ impl CanonicalFixedSizedPod for Rectangle {
         map(
             nom::sequence::pair(u32(Endianness::Native), u32(Endianness::Native)),
             |(width, height)| Rectangle { width, height },
-        )(input)
+        )
+        .parse(input)
     }
 }
 
@@ -586,7 +906,8 @@ impl CanonicalFixedSizedPod for Fraction {
         map(
             nom::sequence::pair(u32(Endianness::Native), u32(Endianness::Native)),
             |(num, denom)| Fraction { num, denom },
-        )(input)
+        )
+        .parse(input)
     }
 }
 
@@ -602,7 +923,7 @@ impl CanonicalFixedSizedPod for Id {
     where
         Self: Sized,
     {
-        map(u32(Endianness::Native), Id)(input)
+        map(u32(Endianness::Native), Id).parse(input)
     }
 }
 
@@ -618,7 +939,7 @@ impl CanonicalFixedSizedPod for Fd {
     where
         Self: Sized,
     {
-        map(i64(Endianness::Native), Fd)(input)
+        map(i64(Endianness::Native), Fd).parse(input)
     }
 }
 

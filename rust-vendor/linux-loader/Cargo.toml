@@ -12,13 +12,14 @@
 [package]
 edition = "2021"
 name = "linux-loader"
-version = "0.13.0"
+version = "0.13.2"
 authors = [
     "The rust-vmm maintainers",
     "rust-vmm AWS maintainers <rust-vmm-maintainers@amazon.com>",
     "Cathy Zhang <cathy.zhang@intel.com>",
 ]
 build = false
+autolib = false
 autobins = false
 autoexamples = false
 autotests = false
@@ -37,9 +38,14 @@ rustdoc-args = [
     "docsrs",
 ]
 
-[profile.bench]
-lto = true
-codegen-units = 1
+[features]
+bzimage = []
+default = [
+    "elf",
+    "pe",
+]
+elf = []
+pe = []
 
 [lib]
 name = "linux_loader"
@@ -52,21 +58,16 @@ path = "benches/main.rs"
 harness = false
 
 [dependencies.vm-memory]
-version = "0.16.0"
+version = ">=0.16.0, <=0.17.1"
 
 [dev-dependencies.criterion]
-version = "0.5.1"
+version = "0.7.0"
 features = ["html_reports"]
 
 [dev-dependencies.vm-memory]
-version = "0.16.0"
+version = ">=0.16.0, <=0.17.1"
 features = ["backend-mmap"]
 
-[features]
-bzimage = []
-default = [
-    "elf",
-    "pe",
-]
-elf = []
-pe = []
+[profile.bench]
+lto = true
+codegen-units = 1

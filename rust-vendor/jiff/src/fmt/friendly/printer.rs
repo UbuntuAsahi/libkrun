@@ -1,20 +1,57 @@
 use crate::{
     fmt::{
-        util::{DecimalFormatter, FractionalFormatter},
-        Write, WriteExt,
+        buffer::{ArrayBuffer, BorrowedBuffer},
+        Write,
     },
     Error, SignedDuration, Span, Unit,
 };
 
-const SECS_PER_HOUR: i64 = MINS_PER_HOUR * SECS_PER_MIN;
-const SECS_PER_MIN: i64 = 60;
-const MINS_PER_HOUR: i64 = 60;
-const NANOS_PER_HOUR: i128 =
-    (SECS_PER_MIN * MINS_PER_HOUR * NANOS_PER_SEC) as i128;
-const NANOS_PER_MIN: i128 = (SECS_PER_MIN * NANOS_PER_SEC) as i128;
-const NANOS_PER_SEC: i64 = 1_000_000_000;
-const NANOS_PER_MILLI: i32 = 1_000_000;
-const NANOS_PER_MICRO: i32 = 1_000;
+const SECS_PER_HOUR: u64 = MINS_PER_HOUR * SECS_PER_MIN;
+const SECS_PER_MIN: u64 = 60;
+const MINS_PER_HOUR: u64 = 60;
+const NANOS_PER_HOUR: u128 =
+    (SECS_PER_MIN * MINS_PER_HOUR * NANOS_PER_SEC) as u128;
+const NANOS_PER_MIN: u128 = (SECS_PER_MIN * NANOS_PER_SEC) as u128;
+const NANOS_PER_SEC: u64 = 1_000_000_000;
+const NANOS_PER_MILLI: u32 = 1_000_000;
+const NANOS_PER_MICRO: u32 = 1_000;
+
+/// Defines the maximum possible length (in bytes) of a `Span` printed in the
+/// friendly format.
+///
+/// The way I computed this length was by using settings that would produce the
+/// maximal amount of text and using a negative `Span` with each unit set to
+/// its minimum value:
+///
+/// ```ignore
+/// SpanPrinter::new()
+///     .padding(u8::MAX)
+///     .designator(friendly::Designator::Verbose)
+///     .spacing(friendly::Spacing::BetweenUnitsAndDesignators)
+///     .comma_after_designator(true);
+/// ```
+const MAX_SPAN_LEN: usize = 306;
+
+/// Defines the maximum possible length (in bytes) of a `SignedDuration`
+/// printed in the friendly format.
+///
+/// See `MAX_SPAN_LEN` for how this was computed. In this case,
+/// `SignedDuration::MIN` was used.
+const MAX_SIGNED_DURATION_LEN: usize = 194;
+
+/// Defines the maximum possible length (in bytes) of a `std::time::Duration`
+/// printed in the friendly format.
+///
+/// See `MAX_SPAN_LEN` for how this was computed. In this case,
+/// `std::time::Duration::MAX - std::time::Duration::from_secs(16)` was used
+/// to find the maximal length. This was a little tricky because the maximal
+/// unsigned duration has minute units equivalent to `0`, and is thus quite a
+/// bit shorter than the maximum possible length.
+///
+/// Note that this is shorter than `MAX_SIGNED_DURATION` because one cannot
+/// get a negative formatted duration from a `std::time::Duration`. So there's
+/// no way to get an ` ago` suffix (or a `-` prefix).
+const MAX_UNSIGNED_DURATION_LEN: usize = 190;
 
 /// Configuration for [`SpanPrinter::designator`].
 ///
@@ -150,19 +187,19 @@ pub enum Spacing {
 }
 
 impl Spacing {
-    fn between_units(self) -> &'static str {
+    fn between_units(self) -> Option<u8> {
         match self {
-            Spacing::None => "",
-            Spacing::BetweenUnits => " ",
-            Spacing::BetweenUnitsAndDesignators => " ",
+            Spacing::None => None,
+            Spacing::BetweenUnits => Some(b' '),
+            Spacing::BetweenUnitsAndDesignators => Some(b' '),
         }
     }
 
-    fn between_units_and_designators(self) -> &'static str {
+    fn between_units_and_designators(self) -> Option<u8> {
         match self {
-            Spacing::None => "",
-            Spacing::BetweenUnits => "",
-            Spacing::BetweenUnitsAndDesignators => " ",
+            Spacing::None => None,
+            Spacing::BetweenUnits => None,
+            Spacing::BetweenUnitsAndDesignators => Some(b' '),
         }
     }
 }
@@ -234,7 +271,7 @@ impl Direction {
             Direction::Auto => match printer.spacing {
                 Spacing::None => {
                     if signum < 0 {
-                        Some(DirectionSign::Prefix("-"))
+                        Some(DirectionSign::Prefix(b'-'))
                     } else {
                         None
                     }
@@ -243,9 +280,9 @@ impl Direction {
                 | Spacing::BetweenUnitsAndDesignators => {
                     if signum < 0 {
                         if printer.hms && !has_calendar {
-                            Some(DirectionSign::Prefix("-"))
+                            Some(DirectionSign::Prefix(b'-'))
                         } else {
-                            Some(DirectionSign::Suffix(" ago"))
+                            Some(DirectionSign::Suffix)
                         }
                     } else {
                         None
@@ -254,17 +291,21 @@ impl Direction {
             },
             Direction::Sign => {
                 if signum < 0 {
-                    Some(DirectionSign::Prefix("-"))
+                    Some(DirectionSign::Prefix(b'-'))
                 } else {
                     None
                 }
             }
             Direction::ForceSign => {
-                Some(DirectionSign::Prefix(if signum < 0 { "-" } else { "+" }))
+                Some(DirectionSign::Prefix(if signum < 0 {
+                    b'-'
+                } else {
+                    b'+'
+                }))
             }
             Direction::Suffix => {
                 if signum < 0 {
-                    Some(DirectionSign::Suffix(" ago"))
+                    Some(DirectionSign::Suffix)
                 } else {
                     None
                 }
@@ -276,8 +317,8 @@ impl Direction {
 /// The sign to write and whether it should be a prefix or a suffix.
 #[derive(Clone, Copy, Debug)]
 enum DirectionSign {
-    Prefix(&'static str),
-    Suffix(&'static str),
+    Prefix(u8),
+    Suffix,
 }
 
 /// Configuration for [`SpanPrinter::fractional`].
@@ -454,7 +495,7 @@ impl From<FractionalUnit> for Unit {
 /// ```
 #[derive(Clone, Debug)]
 pub struct SpanPrinter {
-    designator: Designator,
+    designators: &'static Designators,
     spacing: Spacing,
     direction: Direction,
     fractional: Option<FractionalUnit>,
@@ -490,7 +531,7 @@ impl SpanPrinter {
     #[inline]
     pub const fn new() -> SpanPrinter {
         SpanPrinter {
-            designator: Designator::Compact,
+            designators: Designators::new(Designator::Compact),
             spacing: Spacing::BetweenUnits,
             direction: Direction::Auto,
             fractional: None,
@@ -532,7 +573,7 @@ impl SpanPrinter {
     /// ```
     #[inline]
     pub const fn designator(self, designator: Designator) -> SpanPrinter {
-        SpanPrinter { designator, ..self }
+        SpanPrinter { designators: Designators::new(designator), ..self }
     }
 
     /// Configures the spacing between the units and the designator labels.
@@ -821,6 +862,9 @@ impl SpanPrinter {
     /// of `2` is used for units of hours, minutes and seconds. Otherwise, a
     /// padding of `0` is used.
     ///
+    /// Padding is clamped to a maximum value of `20` (corresponding to the
+    /// number of digits in `u64::MAX`).
+    ///
     /// # Example
     ///
     /// This shows some examples of configuring padding when writing in default
@@ -869,6 +913,9 @@ impl SpanPrinter {
     /// The default value is `None`, which means the precision is automatically
     /// determined from the value. If no fractional component is needed, then
     /// none will be printed.
+    ///
+    /// Precision is capped to a maximum value of `9` (corresponding to the
+    /// maximum precision supported by Jiff).
     ///
     /// # Example
     ///
@@ -1035,6 +1082,49 @@ impl SpanPrinter {
         buf
     }
 
+    /// Format a `std::time::Duration` into a string using the "friendly"
+    /// format.
+    ///
+    /// This balances the units of the duration up to at most hours
+    /// automatically.
+    ///
+    /// This is a convenience routine for
+    /// [`SpanPrinter::print_unsigned_duration`] with a `String`.
+    ///
+    /// # Example
+    ///
+    /// ```
+    /// use std::time::Duration;
+    ///
+    /// use jiff::fmt::friendly::{FractionalUnit, SpanPrinter};
+    ///
+    /// static PRINTER: SpanPrinter = SpanPrinter::new();
+    ///
+    /// let dur = Duration::new(86_525, 123_000_789);
+    /// assert_eq!(
+    ///     PRINTER.unsigned_duration_to_string(&dur),
+    ///     "24h 2m 5s 123ms 789ns",
+    /// );
+    ///
+    /// // Or, if you prefer fractional seconds:
+    /// static PRINTER_FRACTIONAL: SpanPrinter = SpanPrinter::new()
+    ///     .fractional(Some(FractionalUnit::Second));
+    /// assert_eq!(
+    ///     PRINTER_FRACTIONAL.unsigned_duration_to_string(&dur),
+    ///     "24h 2m 5.123000789s",
+    /// );
+    /// ```
+    #[cfg(any(test, feature = "alloc"))]
+    pub fn unsigned_duration_to_string(
+        &self,
+        duration: &core::time::Duration,
+    ) -> alloc::string::String {
+        let mut buf = alloc::string::String::with_capacity(4);
+        // OK because writing to `String` never fails.
+        self.print_unsigned_duration(duration, &mut buf).unwrap();
+        buf
+    }
+
     /// Print a `Span` to the given writer using the "friendly" format.
     ///
     /// # Errors
@@ -1061,12 +1151,16 @@ impl SpanPrinter {
     pub fn print_span<W: Write>(
         &self,
         span: &Span,
-        wtr: W,
+        mut wtr: W,
     ) -> Result<(), Error> {
+        let mut buf = ArrayBuffer::<MAX_SPAN_LEN>::default();
+        let mut bbuf = buf.as_borrowed();
         if self.hms {
-            return self.print_span_hms(span, wtr);
+            self.print_span_hms(span, &mut bbuf);
+        } else {
+            self.print_span_designators(span, &mut bbuf);
         }
-        self.print_span_designators(span, wtr)
+        wtr.write_str(bbuf.filled())
     }
 
     /// Print a `SignedDuration` to the given writer using the "friendly"
@@ -1104,272 +1198,364 @@ impl SpanPrinter {
     pub fn print_duration<W: Write>(
         &self,
         duration: &SignedDuration,
-        wtr: W,
-    ) -> Result<(), Error> {
-        if self.hms {
-            return self.print_duration_hms(duration, wtr);
-        }
-        self.print_duration_designators(duration, wtr)
-    }
-
-    fn print_span_designators<W: Write>(
-        &self,
-        span: &Span,
         mut wtr: W,
     ) -> Result<(), Error> {
-        let mut wtr =
-            DesignatorWriter::new(self, &mut wtr, false, span.signum());
-        wtr.maybe_write_prefix_sign()?;
-        match self.fractional {
-            None => {
-                self.print_span_designators_non_fraction(span, &mut wtr)?;
-            }
-            Some(unit) => {
-                self.print_span_designators_fractional(span, unit, &mut wtr)?;
-            }
+        let mut buf = ArrayBuffer::<MAX_SIGNED_DURATION_LEN>::default();
+        let mut bbuf = buf.as_borrowed();
+        if self.hms {
+            self.print_signed_duration_hms(duration, &mut bbuf);
+        } else {
+            self.print_signed_duration_designators(duration, &mut bbuf);
         }
-        wtr.maybe_write_zero()?;
-        wtr.maybe_write_suffix_sign()?;
-        Ok(())
+        wtr.write_str(bbuf.filled())
     }
 
-    fn print_span_designators_non_fraction<'p, 'w, W: Write>(
+    /// Print a `std::time::Duration` to the given writer using the "friendly"
+    /// format.
+    ///
+    /// This balances the units of the duration up to at most hours
+    /// automatically.
+    ///
+    /// # Errors
+    ///
+    /// This only returns an error when writing to the given [`Write`]
+    /// implementation would fail. Some such implementations, like for `String`
+    /// and `Vec<u8>`, never fail (unless memory allocation fails). In such
+    /// cases, it would be appropriate to call `unwrap()` on the result.
+    ///
+    /// # Example
+    ///
+    /// ```
+    /// use std::time::Duration;
+    ///
+    /// use jiff::fmt::friendly::SpanPrinter;
+    ///
+    /// static PRINTER: SpanPrinter = SpanPrinter::new();
+    ///
+    /// let dur = Duration::new(86_525, 123_000_789);
+    ///
+    /// let mut buf = String::new();
+    /// // Printing to a `String` can never fail.
+    /// PRINTER.print_unsigned_duration(&dur, &mut buf).unwrap();
+    /// assert_eq!(buf, "24h 2m 5s 123ms 789ns");
+    /// ```
+    pub fn print_unsigned_duration<W: Write>(
+        &self,
+        duration: &core::time::Duration,
+        mut wtr: W,
+    ) -> Result<(), Error> {
+        let mut buf = ArrayBuffer::<MAX_UNSIGNED_DURATION_LEN>::default();
+        let mut bbuf = buf.as_borrowed();
+        if self.hms {
+            self.print_unsigned_duration_hms(duration, &mut bbuf);
+        } else {
+            self.print_unsigned_duration_designators(duration, &mut bbuf);
+        }
+        wtr.write_str(bbuf.filled())
+    }
+
+    fn print_span_designators(
         &self,
         span: &Span,
-        wtr: &mut DesignatorWriter<'p, 'w, W>,
-    ) -> Result<(), Error> {
-        let span = span.abs();
-        if span.get_years() != 0 {
-            wtr.write(Unit::Year, span.get_years())?;
+        bbuf: &mut BorrowedBuffer<'_>,
+    ) {
+        let mut wtr = DesignatorWriter::new(self, bbuf, false, span.signum());
+        wtr.maybe_write_prefix_sign();
+        match self.fractional {
+            None => {
+                self.print_span_designators_non_fraction(span, &mut wtr);
+            }
+            Some(unit) => {
+                self.print_span_designators_fractional(span, unit, &mut wtr);
+            }
         }
-        if span.get_months() != 0 {
-            wtr.write(Unit::Month, span.get_months())?;
+        wtr.maybe_write_zero();
+        wtr.maybe_write_suffix_sign();
+    }
+
+    fn print_span_designators_non_fraction<'p, 'w, 'd>(
+        &self,
+        span: &Span,
+        wtr: &mut DesignatorWriter<'p, 'w, 'd>,
+    ) {
+        let units = span.units();
+
+        if units.contains(Unit::Year) {
+            wtr.write(Unit::Year, span.get_years_unsigned().into());
         }
-        if span.get_weeks() != 0 {
-            wtr.write(Unit::Week, span.get_weeks())?;
+        if units.contains(Unit::Month) {
+            wtr.write(Unit::Month, span.get_months_unsigned().into());
         }
-        if span.get_days() != 0 {
-            wtr.write(Unit::Day, span.get_days())?;
+        if units.contains(Unit::Week) {
+            wtr.write(Unit::Week, span.get_weeks_unsigned().into());
         }
-        if span.get_hours() != 0 {
-            wtr.write(Unit::Hour, span.get_hours())?;
+        if units.contains(Unit::Day) {
+            wtr.write(Unit::Day, span.get_days_unsigned().into());
         }
-        if span.get_minutes() != 0 {
-            wtr.write(Unit::Minute, span.get_minutes())?;
+        if units.contains(Unit::Hour) {
+            wtr.write(Unit::Hour, span.get_hours_unsigned().into());
         }
-        if span.get_seconds() != 0 {
-            wtr.write(Unit::Second, span.get_seconds())?;
+        if units.contains(Unit::Minute) {
+            wtr.write(Unit::Minute, span.get_minutes_unsigned());
         }
-        if span.get_milliseconds() != 0 {
-            wtr.write(Unit::Millisecond, span.get_milliseconds())?;
+        if units.contains(Unit::Second) {
+            wtr.write(Unit::Second, span.get_seconds_unsigned());
         }
-        if span.get_microseconds() != 0 {
-            wtr.write(Unit::Microsecond, span.get_microseconds())?;
+        if units.contains(Unit::Millisecond) {
+            wtr.write(Unit::Millisecond, span.get_milliseconds_unsigned());
         }
-        if span.get_nanoseconds() != 0 {
-            wtr.write(Unit::Nanosecond, span.get_nanoseconds())?;
+        if units.contains(Unit::Microsecond) {
+            wtr.write(Unit::Microsecond, span.get_microseconds_unsigned());
         }
-        Ok(())
+        if units.contains(Unit::Nanosecond) {
+            wtr.write(Unit::Nanosecond, span.get_nanoseconds_unsigned());
+        }
+    }
+
+    fn print_span_calendar_designators_non_fraction<'p, 'w, 'd>(
+        &self,
+        span: &Span,
+        wtr: &mut DesignatorWriter<'p, 'w, 'd>,
+    ) {
+        let units = span.units();
+
+        if units.contains(Unit::Year) {
+            wtr.write(Unit::Year, span.get_years_unsigned().into());
+        }
+        if units.contains(Unit::Month) {
+            wtr.write(Unit::Month, span.get_months_unsigned().into());
+        }
+        if units.contains(Unit::Week) {
+            wtr.write(Unit::Week, span.get_weeks_unsigned().into());
+        }
+        if units.contains(Unit::Day) {
+            wtr.write(Unit::Day, span.get_days_unsigned().into());
+        }
     }
 
     #[inline(never)]
-    fn print_span_designators_fractional<'p, 'w, W: Write>(
+    fn print_span_designators_fractional<'p, 'w, 'd>(
         &self,
         span: &Span,
         unit: FractionalUnit,
-        wtr: &mut DesignatorWriter<'p, 'w, W>,
-    ) -> Result<(), Error> {
+        wtr: &mut DesignatorWriter<'p, 'w, 'd>,
+    ) {
         // OK because the biggest FractionalUnit is Hour, and there is always
         // a Unit bigger than hour.
         let split_at = Unit::from(unit).next().unwrap();
         let non_fractional = span.without_lower(split_at);
         let fractional = span.only_lower(split_at);
-        self.print_span_designators_non_fraction(&non_fractional, wtr)?;
+        self.print_span_designators_non_fraction(&non_fractional, wtr);
         wtr.write_fractional_duration(
             unit,
-            &fractional.to_duration_invariant(),
-        )?;
-        Ok(())
+            &fractional.to_invariant_duration().unsigned_abs(),
+        );
     }
 
-    fn print_span_hms<W: Write>(
-        &self,
-        span: &Span,
-        mut wtr: W,
-    ) -> Result<(), Error> {
-        let span_cal = span.only_calendar();
-        let mut span_time = span.only_time();
-        let has_cal = !span_cal.is_zero();
-
+    fn print_span_hms(&self, span: &Span, bbuf: &mut BorrowedBuffer<'_>) {
+        let has_cal = !span.units().only_calendar().is_empty();
         let mut wtr =
-            DesignatorWriter::new(self, &mut wtr, has_cal, span.signum());
-        wtr.maybe_write_prefix_sign()?;
+            DesignatorWriter::new(self, bbuf, has_cal, span.signum());
+        let span = span.abs();
+
+        wtr.maybe_write_prefix_sign();
         if has_cal {
-            self.print_span_designators_non_fraction(&span_cal, &mut wtr)?;
-            wtr.finish_preceding()?;
+            self.print_span_calendar_designators_non_fraction(&span, &mut wtr);
+            wtr.finish_preceding();
             // When spacing is disabled, then `finish_preceding` won't write
             // any spaces. But this would result in, e.g., `1yr15:00:00`, which
             // is just totally wrong. So detect that case here and insert a
             // space forcefully.
             if matches!(self.spacing, Spacing::None) {
-                wtr.wtr.write_str(" ")?;
+                wtr.bbuf.write_ascii_char(b' ');
             }
         }
-        span_time = span_time.abs();
 
-        let fmtint =
-            DecimalFormatter::new().padding(self.padding.unwrap_or(2));
-        let fmtfraction = FractionalFormatter::new().precision(self.precision);
-        wtr.wtr.write_int(&fmtint, span_time.get_hours_ranged().get())?;
-        wtr.wtr.write_str(":")?;
-        wtr.wtr.write_int(&fmtint, span_time.get_minutes_ranged().get())?;
-        wtr.wtr.write_str(":")?;
-        let fp = FractionalPrinter::from_span(
-            &span_time.only_lower(Unit::Minute),
-            FractionalUnit::Second,
-            fmtint,
-            fmtfraction,
+        let padding = self.padding.unwrap_or(2);
+        wtr.bbuf.write_int_pad(span.get_hours_unsigned(), b'0', padding);
+        wtr.bbuf.write_ascii_char(b':');
+        wtr.bbuf.write_int_pad(span.get_minutes_unsigned(), b'0', padding);
+        wtr.bbuf.write_ascii_char(b':');
+        // You'd think we could do better here from a code size
+        // perspective. But when I tried to inline the logic to
+        // get a `SignedDuration` from just sub-minute units,
+        // code size actually increased. ¯\_(ツ)_/¯
+        let fp = FractionalPrinter::from_span_seconds(
+            &span.only_lower(Unit::Minute),
+            padding,
+            self.precision,
         );
-        fp.print(&mut wtr.wtr)?;
-        wtr.maybe_write_suffix_sign()?;
-        Ok(())
+        fp.print(wtr.bbuf);
+        wtr.maybe_write_suffix_sign();
     }
 
-    fn print_duration_designators<W: Write>(
+    fn print_signed_duration_designators(
         &self,
         dur: &SignedDuration,
-        mut wtr: W,
-    ) -> Result<(), Error> {
-        let mut wtr =
-            DesignatorWriter::new(self, &mut wtr, false, dur.signum());
-        wtr.maybe_write_prefix_sign()?;
+        bbuf: &mut BorrowedBuffer<'_>,
+    ) {
+        let mut wtr = DesignatorWriter::new(self, bbuf, false, dur.signum());
+        wtr.maybe_write_prefix_sign();
+        self.print_duration_designators(&dur.unsigned_abs(), &mut wtr);
+        wtr.maybe_write_zero();
+        wtr.maybe_write_suffix_sign();
+    }
+
+    fn print_unsigned_duration_designators(
+        &self,
+        dur: &core::time::Duration,
+        bbuf: &mut BorrowedBuffer<'_>,
+    ) {
+        let mut wtr = DesignatorWriter::new(self, bbuf, false, 1);
+        wtr.maybe_write_prefix_sign();
+        self.print_duration_designators(dur, &mut wtr);
+        wtr.maybe_write_zero();
+    }
+
+    fn print_duration_designators(
+        &self,
+        dur: &core::time::Duration,
+        wtr: &mut DesignatorWriter<'_, '_, '_>,
+    ) {
         match self.fractional {
             None => {
                 let mut secs = dur.as_secs();
-                wtr.write(Unit::Hour, (secs / SECS_PER_HOUR).abs())?;
+                wtr.write(Unit::Hour, secs / SECS_PER_HOUR);
                 secs %= MINS_PER_HOUR * SECS_PER_MIN;
-                wtr.write(Unit::Minute, (secs / SECS_PER_MIN).abs())?;
-                wtr.write(Unit::Second, (secs % SECS_PER_MIN).abs())?;
+                wtr.write(Unit::Minute, secs / SECS_PER_MIN);
+                wtr.write(Unit::Second, secs % SECS_PER_MIN);
                 let mut nanos = dur.subsec_nanos();
-                wtr.write(Unit::Millisecond, (nanos / NANOS_PER_MILLI).abs())?;
+                wtr.write(Unit::Millisecond, (nanos / NANOS_PER_MILLI).into());
                 nanos %= NANOS_PER_MILLI;
-                wtr.write(Unit::Microsecond, (nanos / NANOS_PER_MICRO).abs())?;
-                wtr.write(Unit::Nanosecond, (nanos % NANOS_PER_MICRO).abs())?;
+                wtr.write(Unit::Microsecond, (nanos / NANOS_PER_MICRO).into());
+                wtr.write(Unit::Nanosecond, (nanos % NANOS_PER_MICRO).into());
             }
             Some(FractionalUnit::Hour) => {
-                wtr.write_fractional_duration(FractionalUnit::Hour, dur)?;
+                wtr.write_fractional_duration(FractionalUnit::Hour, &dur);
             }
             Some(FractionalUnit::Minute) => {
                 let mut secs = dur.as_secs();
-                wtr.write(Unit::Hour, (secs / SECS_PER_HOUR).abs())?;
+                wtr.write(Unit::Hour, secs / SECS_PER_HOUR);
                 secs %= MINS_PER_HOUR * SECS_PER_MIN;
 
-                let leftovers = SignedDuration::new(secs, dur.subsec_nanos());
+                let leftovers =
+                    core::time::Duration::new(secs, dur.subsec_nanos());
                 wtr.write_fractional_duration(
                     FractionalUnit::Minute,
                     &leftovers,
-                )?;
+                );
             }
             Some(FractionalUnit::Second) => {
                 let mut secs = dur.as_secs();
-                wtr.write(Unit::Hour, (secs / SECS_PER_HOUR).abs())?;
+                wtr.write(Unit::Hour, secs / SECS_PER_HOUR);
                 secs %= MINS_PER_HOUR * SECS_PER_MIN;
-                wtr.write(Unit::Minute, (secs / SECS_PER_MIN).abs())?;
+                wtr.write(Unit::Minute, secs / SECS_PER_MIN);
                 secs %= SECS_PER_MIN;
 
-                // Absolute value is OK because -59<=secs<=59 and nanoseconds
-                // can never be i32::MIN.
                 let leftovers =
-                    SignedDuration::new(secs, dur.subsec_nanos()).abs();
+                    core::time::Duration::new(secs, dur.subsec_nanos());
                 wtr.write_fractional_duration(
                     FractionalUnit::Second,
                     &leftovers,
-                )?;
+                );
             }
             Some(FractionalUnit::Millisecond) => {
                 let mut secs = dur.as_secs();
-                wtr.write(Unit::Hour, (secs / SECS_PER_HOUR).abs())?;
+                wtr.write(Unit::Hour, secs / SECS_PER_HOUR);
                 secs %= MINS_PER_HOUR * SECS_PER_MIN;
-                wtr.write(Unit::Minute, (secs / SECS_PER_MIN).abs())?;
-                wtr.write(Unit::Second, (secs % SECS_PER_MIN).abs())?;
+                wtr.write(Unit::Minute, secs / SECS_PER_MIN);
+                wtr.write(Unit::Second, secs % SECS_PER_MIN);
 
                 let leftovers =
-                    SignedDuration::new(0, dur.subsec_nanos().abs());
+                    core::time::Duration::new(0, dur.subsec_nanos());
                 wtr.write_fractional_duration(
                     FractionalUnit::Millisecond,
                     &leftovers,
-                )?;
+                );
             }
             Some(FractionalUnit::Microsecond) => {
                 let mut secs = dur.as_secs();
-                wtr.write(Unit::Hour, (secs / SECS_PER_HOUR).abs())?;
+                wtr.write(Unit::Hour, secs / SECS_PER_HOUR);
                 secs %= MINS_PER_HOUR * SECS_PER_MIN;
-                wtr.write(Unit::Minute, (secs / SECS_PER_MIN).abs())?;
-                wtr.write(Unit::Second, (secs % SECS_PER_MIN).abs())?;
+                wtr.write(Unit::Minute, secs / SECS_PER_MIN);
+                wtr.write(Unit::Second, secs % SECS_PER_MIN);
                 let mut nanos = dur.subsec_nanos();
-                wtr.write(Unit::Millisecond, (nanos / NANOS_PER_MILLI).abs())?;
+                wtr.write(Unit::Millisecond, (nanos / NANOS_PER_MILLI).into());
                 nanos %= NANOS_PER_MILLI;
 
-                let leftovers = SignedDuration::new(0, nanos.abs());
+                let leftovers = core::time::Duration::new(0, nanos);
                 wtr.write_fractional_duration(
                     FractionalUnit::Microsecond,
                     &leftovers,
-                )?;
+                );
             }
         }
-        wtr.maybe_write_zero()?;
-        wtr.maybe_write_suffix_sign()?;
-        Ok(())
     }
 
-    fn print_duration_hms<W: Write>(
+    fn print_signed_duration_hms(
         &self,
         dur: &SignedDuration,
-        mut wtr: W,
-    ) -> Result<(), Error> {
-        // N.B. It should be technically correct to convert a
-        // `SignedDuration` to `Span` (since this process balances)
-        // and then format the `Span` as-is. But this doesn't work
-        // because the range of a `SignedDuration` is much bigger.
-
-        let fmtint =
-            DecimalFormatter::new().padding(self.padding.unwrap_or(2));
-        let fmtfraction = FractionalFormatter::new().precision(self.precision);
-
+        bbuf: &mut BorrowedBuffer<'_>,
+    ) {
         if dur.is_negative() {
             if !matches!(self.direction, Direction::Suffix) {
-                wtr.write_str("-")?;
+                bbuf.write_ascii_char(b'-');
             }
         } else if let Direction::ForceSign = self.direction {
-            wtr.write_str("+")?;
+            bbuf.write_ascii_char(b'+');
         }
-        let mut secs = dur.as_secs();
-        // OK because guaranteed to be bigger than i64::MIN.
-        let hours = (secs / (MINS_PER_HOUR * SECS_PER_MIN)).abs();
-        secs %= MINS_PER_HOUR * SECS_PER_MIN;
-        // OK because guaranteed to be bigger than i64::MIN.
-        let minutes = (secs / SECS_PER_MIN).abs();
-        // OK because guaranteed to be bigger than i64::MIN.
-        secs = (secs % SECS_PER_MIN).abs();
-
-        wtr.write_int(&fmtint, hours)?;
-        wtr.write_str(":")?;
-        wtr.write_int(&fmtint, minutes)?;
-        wtr.write_str(":")?;
-        let fp = FractionalPrinter::from_duration(
-            // OK because -999_999_999 <= nanos <= 999_999_999 and secs < 60.
-            &SignedDuration::new(secs, dur.subsec_nanos().abs()),
-            FractionalUnit::Second,
-            fmtint,
-            fmtfraction,
-        );
-        fp.print(&mut wtr)?;
+        self.print_duration_hms(&dur.unsigned_abs(), bbuf);
         if dur.is_negative() {
             if matches!(self.direction, Direction::Suffix) {
-                wtr.write_str(" ago")?;
+                bbuf.write_str(" ago");
             }
         }
-        Ok(())
+    }
+
+    fn print_unsigned_duration_hms(
+        &self,
+        dur: &core::time::Duration,
+        bbuf: &mut BorrowedBuffer<'_>,
+    ) {
+        if let Direction::ForceSign = self.direction {
+            bbuf.write_ascii_char(b'+');
+        }
+        self.print_duration_hms(dur, bbuf);
+    }
+
+    fn print_duration_hms(
+        &self,
+        udur: &core::time::Duration,
+        bbuf: &mut BorrowedBuffer<'_>,
+    ) {
+        // N.B. It should be technically correct to convert a `SignedDuration`
+        // (or `core::time::Duration`) to `Span` (since this process balances)
+        // and then format the `Span` as-is. But this doesn't work because the
+        // range of a `SignedDuration` (and `core::time::Duration`) is much
+        // bigger.
+
+        let padding = self.padding.unwrap_or(2);
+
+        let mut secs = udur.as_secs();
+        // OK because guaranteed to be bigger than i64::MIN.
+        let hours = secs / (MINS_PER_HOUR * SECS_PER_MIN);
+        secs %= MINS_PER_HOUR * SECS_PER_MIN;
+        // OK because guaranteed to be bigger than i64::MIN.
+        let minutes = secs / SECS_PER_MIN;
+        // OK because guaranteed to be bigger than i64::MIN.
+        secs = secs % SECS_PER_MIN;
+
+        bbuf.write_int_pad(hours, b'0', padding);
+        bbuf.write_ascii_char(b':');
+        bbuf.write_int_pad(minutes, b'0', padding);
+        bbuf.write_ascii_char(b':');
+        let fp = FractionalPrinter::from_duration_seconds(
+            // OK because -999_999_999 <= nanos <= 999_999_999 and secs < 60.
+            &core::time::Duration::new(secs, udur.subsec_nanos()),
+            padding,
+            self.precision,
+        );
+        fp.print(bbuf);
     }
 }
 
@@ -1384,14 +1570,14 @@ impl Default for SpanPrinter {
 /// Basically, whether we want verbose, short or compact designators. This in
 /// turn permits lookups based on `Unit`, which makes writing generic code for
 /// writing designators a bit nicer and still fast.
-#[derive(Debug)]
+#[derive(Clone, Debug)]
 struct Designators {
-    singular: &'static [&'static str],
-    plural: &'static [&'static str],
+    singular: [&'static str; 10],
+    plural: [&'static str; 10],
 }
 
 impl Designators {
-    const VERBOSE_SINGULAR: &'static [&'static str] = &[
+    const VERBOSE_SINGULAR: [&'static str; 10] = [
         "nanosecond",
         "microsecond",
         "millisecond",
@@ -1403,7 +1589,7 @@ impl Designators {
         "month",
         "year",
     ];
-    const VERBOSE_PLURAL: &'static [&'static str] = &[
+    const VERBOSE_PLURAL: [&'static str; 10] = [
         "nanoseconds",
         "microseconds",
         "milliseconds",
@@ -1416,36 +1602,36 @@ impl Designators {
         "years",
     ];
 
-    const SHORT_SINGULAR: &'static [&'static str] =
-        &["nsec", "µsec", "msec", "sec", "min", "hr", "day", "wk", "mo", "yr"];
-    const SHORT_PLURAL: &'static [&'static str] = &[
+    const SHORT_SINGULAR: [&'static str; 10] =
+        ["nsec", "µsec", "msec", "sec", "min", "hr", "day", "wk", "mo", "yr"];
+    const SHORT_PLURAL: [&'static str; 10] = [
         "nsecs", "µsecs", "msecs", "secs", "mins", "hrs", "days", "wks",
         "mos", "yrs",
     ];
 
-    const COMPACT: &'static [&'static str] =
-        &["ns", "µs", "ms", "s", "m", "h", "d", "w", "mo", "y"];
+    const COMPACT: [&'static str; 10] =
+        ["ns", "µs", "ms", "s", "m", "h", "d", "w", "mo", "y"];
 
-    const HUMAN_TIME_SINGULAR: &'static [&'static str] =
-        &["ns", "us", "ms", "s", "m", "h", "d", "w", "month", "y"];
-    const HUMAN_TIME_PLURAL: &'static [&'static str] =
-        &["ns", "us", "ms", "s", "m", "h", "d", "w", "months", "y"];
+    const HUMAN_TIME_SINGULAR: [&'static str; 10] =
+        ["ns", "us", "ms", "s", "m", "h", "d", "w", "month", "y"];
+    const HUMAN_TIME_PLURAL: [&'static str; 10] =
+        ["ns", "us", "ms", "s", "m", "h", "d", "w", "months", "y"];
 
-    fn new(config: Designator) -> Designators {
+    const fn new(config: Designator) -> &'static Designators {
         match config {
-            Designator::Verbose => Designators {
+            Designator::Verbose => &Designators {
                 singular: Designators::VERBOSE_SINGULAR,
                 plural: Designators::VERBOSE_PLURAL,
             },
-            Designator::Short => Designators {
+            Designator::Short => &Designators {
                 singular: Designators::SHORT_SINGULAR,
                 plural: Designators::SHORT_PLURAL,
             },
-            Designator::Compact => Designators {
+            Designator::Compact => &Designators {
                 singular: Designators::COMPACT,
                 plural: Designators::COMPACT,
             },
-            Designator::HumanTime => Designators {
+            Designator::HumanTime => &Designators {
                 singular: Designators::HUMAN_TIME_SINGULAR,
                 plural: Designators::HUMAN_TIME_PLURAL,
             },
@@ -1469,121 +1655,123 @@ impl Designators {
 /// mutable state that influences printing. For example, whether to write a
 /// delimiter or not (one should only come after a unit that has been written).
 #[derive(Debug)]
-struct DesignatorWriter<'p, 'w, W> {
+struct DesignatorWriter<'p, 'w, 'd> {
     printer: &'p SpanPrinter,
-    wtr: &'w mut W,
-    desig: Designators,
+    bbuf: &'w mut BorrowedBuffer<'d>,
     sign: Option<DirectionSign>,
-    fmtint: DecimalFormatter,
-    fmtfraction: FractionalFormatter,
+    padding: u8,
+    precision: Option<u8>,
     written_non_zero_unit: bool,
 }
 
-impl<'p, 'w, W: Write> DesignatorWriter<'p, 'w, W> {
+impl<'p, 'w, 'd> DesignatorWriter<'p, 'w, 'd> {
     fn new(
         printer: &'p SpanPrinter,
-        wtr: &'w mut W,
+        bbuf: &'w mut BorrowedBuffer<'d>,
         has_calendar: bool,
         signum: i8,
-    ) -> DesignatorWriter<'p, 'w, W> {
-        let desig = Designators::new(printer.designator);
+    ) -> DesignatorWriter<'p, 'w, 'd> {
         let sign = printer.direction.sign(printer, has_calendar, signum);
-        let fmtint =
-            DecimalFormatter::new().padding(printer.padding.unwrap_or(0));
-        let fmtfraction =
-            FractionalFormatter::new().precision(printer.precision);
         DesignatorWriter {
             printer,
-            wtr,
-            desig,
+            bbuf,
             sign,
-            fmtint,
-            fmtfraction,
+            padding: printer.padding.unwrap_or(0),
+            precision: printer.precision,
             written_non_zero_unit: false,
         }
     }
 
-    fn maybe_write_prefix_sign(&mut self) -> Result<(), Error> {
+    fn maybe_write_prefix_sign(&mut self) {
         if let Some(DirectionSign::Prefix(sign)) = self.sign {
-            self.wtr.write_str(sign)?;
+            self.bbuf.write_ascii_char(sign);
         }
-        Ok(())
     }
 
-    fn maybe_write_suffix_sign(&mut self) -> Result<(), Error> {
-        if let Some(DirectionSign::Suffix(sign)) = self.sign {
-            self.wtr.write_str(sign)?;
+    fn maybe_write_suffix_sign(&mut self) {
+        if let Some(DirectionSign::Suffix) = self.sign {
+            self.bbuf.write_str(" ago");
         }
-        Ok(())
     }
 
-    fn maybe_write_zero(&mut self) -> Result<(), Error> {
-        if self.written_non_zero_unit {
-            return Ok(());
+    fn maybe_write_zero(&mut self) {
+        #[cold]
+        #[inline(never)]
+        fn imp(wtr: &mut DesignatorWriter<'_, '_, '_>) {
+            wtr.bbuf.write_int_pad(0u64, b'0', wtr.padding);
+            if let Some(byte) =
+                wtr.printer.spacing.between_units_and_designators()
+            {
+                wtr.bbuf.write_ascii_char(byte);
+            }
+            // If a fractional unit is set, then we should use that unit
+            // specifically to express "zero."
+            let unit = wtr
+                .printer
+                .fractional
+                .map(Unit::from)
+                .unwrap_or(wtr.printer.zero_unit);
+            wtr.bbuf.write_str(wtr.printer.designators.designator(unit, true));
         }
-        // If a fractional unit is set, then we should use that unit
-        // specifically to express "zero."
-        let unit = self
-            .printer
-            .fractional
-            .map(Unit::from)
-            .unwrap_or(self.printer.zero_unit);
-        self.wtr.write_int(&self.fmtint, 0)?;
-        self.wtr
-            .write_str(self.printer.spacing.between_units_and_designators())?;
-        self.wtr.write_str(self.desig.designator(unit, true))?;
-        Ok(())
+
+        if !self.written_non_zero_unit {
+            imp(self);
+        }
     }
 
-    fn write(
-        &mut self,
-        unit: Unit,
-        value: impl Into<i64>,
-    ) -> Result<(), Error> {
-        let value = value.into();
+    #[inline(never)]
+    fn write(&mut self, unit: Unit, value: u64) {
         if value == 0 {
-            return Ok(());
+            return;
         }
-        self.finish_preceding()?;
+        self.finish_preceding();
         self.written_non_zero_unit = true;
-        self.wtr.write_int(&self.fmtint, value)?;
-        self.wtr
-            .write_str(self.printer.spacing.between_units_and_designators())?;
-        self.wtr.write_str(self.desig.designator(unit, value != 1))?;
-        Ok(())
+        self.bbuf.write_int_pad0(value, self.padding);
+        if let Some(byte) =
+            self.printer.spacing.between_units_and_designators()
+        {
+            self.bbuf.write_ascii_char(byte);
+        }
+        self.bbuf
+            .write_str(self.printer.designators.designator(unit, value != 1));
     }
 
     fn write_fractional_duration(
         &mut self,
         unit: FractionalUnit,
-        duration: &SignedDuration,
-    ) -> Result<(), Error> {
+        duration: &core::time::Duration,
+    ) {
         let fp = FractionalPrinter::from_duration(
             duration,
             unit,
-            self.fmtint,
-            self.fmtfraction,
+            self.padding,
+            self.precision,
         );
         if !fp.must_write_digits() {
-            return Ok(());
+            return;
         }
-        self.finish_preceding()?;
+        self.finish_preceding();
         self.written_non_zero_unit = true;
-        fp.print(&mut *self.wtr)?;
-        self.wtr
-            .write_str(self.printer.spacing.between_units_and_designators())?;
-        self.wtr.write_str(self.desig.designator(unit, fp.is_plural()))?;
-        Ok(())
+        fp.print(&mut *self.bbuf);
+        if let Some(byte) =
+            self.printer.spacing.between_units_and_designators()
+        {
+            self.bbuf.write_ascii_char(byte);
+        }
+        self.bbuf.write_str(
+            self.printer.designators.designator(unit, fp.is_plural()),
+        );
     }
 
-    fn finish_preceding(&mut self) -> Result<(), Error> {
+    fn finish_preceding(&mut self) {
         if self.written_non_zero_unit {
             if self.printer.comma_after_designator {
-                self.wtr.write_str(",")?;
+                self.bbuf.write_ascii_char(b',');
             }
-            self.wtr.write_str(self.printer.spacing.between_units())?;
+            if let Some(byte) = self.printer.spacing.between_units() {
+                self.bbuf.write_ascii_char(byte);
+            }
         }
-        Ok(())
     }
 }
 
@@ -1592,10 +1780,10 @@ impl<'p, 'w, W: Write> DesignatorWriter<'p, 'w, W> {
 /// This also includes the formatter for the integer component and the
 /// formatter for the fractional component.
 struct FractionalPrinter {
-    integer: i64,
-    fraction: i64,
-    fmtint: DecimalFormatter,
-    fmtfraction: FractionalFormatter,
+    integer: u64,
+    fraction: u32,
+    padding: u8,
+    precision: Option<u8>,
 }
 
 impl FractionalPrinter {
@@ -1608,85 +1796,88 @@ impl FractionalPrinter {
     /// if necessary. For example, if the fractional component is zero and
     /// precision is `None`, or if `precision` is `Some(0)`, then no fractional
     /// component will be emitted.
-    fn from_span(
+    fn from_span_seconds(
         span: &Span,
-        unit: FractionalUnit,
-        fmtint: DecimalFormatter,
-        fmtfraction: FractionalFormatter,
+        padding: u8,
+        precision: Option<u8>,
     ) -> FractionalPrinter {
-        debug_assert!(span.largest_unit() <= Unit::from(unit));
-        let dur = span.to_duration_invariant();
-        FractionalPrinter::from_duration(&dur, unit, fmtint, fmtfraction)
+        FractionalPrinter::from_duration_seconds(
+            &span.to_invariant_duration().unsigned_abs(),
+            padding,
+            precision,
+        )
     }
 
-    /// Like `from_span`, but for `SignedDuration`.
-    fn from_duration(
-        dur: &SignedDuration,
-        unit: FractionalUnit,
-        fmtint: DecimalFormatter,
-        fmtfraction: FractionalFormatter,
+    /// Like `from_span_seconds`, but for `SignedDuration`.
+    fn from_duration_seconds(
+        dur: &core::time::Duration,
+        padding: u8,
+        precision: Option<u8>,
     ) -> FractionalPrinter {
-        // Should we assume `dur` is non-negative in this context?
-        // I don't think we can in general, because `dur` could
-        // be `SignedDuration::MIN` in the case where `unit` is
-        // `FractionalUnit::Hour`. In this case, the caller can't call `abs`
-        // because it would panic.
+        let integer = dur.as_secs();
+        let fraction = u32::from(dur.subsec_nanos());
+        FractionalPrinter { integer, fraction, padding, precision }
+    }
+
+    /// Like `from_duration_seconds`, but for any fractional unit.
+    fn from_duration(
+        dur: &core::time::Duration,
+        unit: FractionalUnit,
+        padding: u8,
+        precision: Option<u8>,
+    ) -> FractionalPrinter {
         match unit {
             FractionalUnit::Hour => {
-                let integer = (dur.as_secs() / SECS_PER_HOUR).abs();
-                let fraction = dur.as_nanos() % NANOS_PER_HOUR;
-                // OK because NANOS_PER_HOUR fits in an i64.
-                debug_assert!(fraction <= i128::from(i64::MAX));
-                let mut fraction = i64::try_from(fraction).unwrap();
+                let integer = dur.as_secs() / SECS_PER_HOUR;
+                let mut fraction = dur.as_nanos() % NANOS_PER_HOUR;
                 // Drop precision since we're only allowed 9 decimal places.
-                fraction /= SECS_PER_HOUR;
-                // OK because fraction can't be i64::MIN.
-                fraction = fraction.abs();
-                FractionalPrinter { integer, fraction, fmtint, fmtfraction }
+                fraction /= u128::from(SECS_PER_HOUR);
+                // OK because NANOS_PER_HOUR / SECS_PER_HOUR fits in a u32.
+                let fraction = u32::try_from(fraction).unwrap();
+                FractionalPrinter { integer, fraction, padding, precision }
             }
             FractionalUnit::Minute => {
-                let integer = (dur.as_secs() / SECS_PER_MIN).abs();
-                let fraction = dur.as_nanos() % NANOS_PER_MIN;
-                // OK because NANOS_PER_HOUR fits in an i64.
-                debug_assert!(fraction <= i128::from(i64::MAX));
-                let mut fraction = i64::try_from(fraction).unwrap();
+                let integer = dur.as_secs() / SECS_PER_MIN;
+                let mut fraction = dur.as_nanos() % NANOS_PER_MIN;
                 // Drop precision since we're only allowed 9 decimal places.
-                fraction /= SECS_PER_MIN;
-                // OK because fraction can't be i64::MIN.
-                fraction = fraction.abs();
-                FractionalPrinter { integer, fraction, fmtint, fmtfraction }
+                fraction /= u128::from(SECS_PER_MIN);
+                // OK because NANOS_PER_MIN fits in an u32.
+                let fraction = u32::try_from(fraction).unwrap();
+                FractionalPrinter { integer, fraction, padding, precision }
             }
             FractionalUnit::Second => {
                 let integer = dur.as_secs();
-                let fraction = i64::from(dur.subsec_nanos());
-                FractionalPrinter { integer, fraction, fmtint, fmtfraction }
+                let fraction = u32::from(dur.subsec_nanos());
+                FractionalPrinter { integer, fraction, padding, precision }
             }
             FractionalUnit::Millisecond => {
                 // Unwrap is OK, but this is subtle. For printing a
                 // SignedDuration, as_millis() can never return anything
-                // bigger than 1 second. So that case is clearly okay. But
+                // bigger than 1 second, because the duration given is reduced
+                // in a balanced fashion before hitting this routine. But
                 // for printing a Span, it can, since spans can be totally
                 // unbalanced. But Spans have limits on their units such that
                 // each will fit into an i64. So this is also okay in that case
                 // too.
-                let integer = i64::try_from(dur.as_millis()).unwrap();
+                let integer = u64::try_from(dur.as_millis()).unwrap();
                 let fraction =
-                    i64::from((dur.subsec_nanos() % NANOS_PER_MILLI) * 1_000);
-                FractionalPrinter { integer, fraction, fmtint, fmtfraction }
+                    u32::from((dur.subsec_nanos() % NANOS_PER_MILLI) * 1_000);
+                FractionalPrinter { integer, fraction, padding, precision }
             }
             FractionalUnit::Microsecond => {
                 // Unwrap is OK, but this is subtle. For printing a
-                // SignedDuration, as_micros() can never return anything
-                // bigger than 1 millisecond. So that case is clearly okay. But
+                // SignedDuration, as_millis() can never return anything
+                // bigger than 1 second, because the duration given is reduced
+                // in a balanced fashion before hitting this routine. But
                 // for printing a Span, it can, since spans can be totally
                 // unbalanced. But Spans have limits on their units such that
                 // each will fit into an i64. So this is also okay in that case
                 // too.
-                let integer = i64::try_from(dur.as_micros()).unwrap();
-                let fraction = i64::from(
+                let integer = u64::try_from(dur.as_micros()).unwrap();
+                let fraction = u32::from(
                     (dur.subsec_nanos() % NANOS_PER_MICRO) * 1_000_000,
                 );
-                FractionalPrinter { integer, fraction, fmtint, fmtfraction }
+                FractionalPrinter { integer, fraction, padding, precision }
             }
         }
     }
@@ -1700,8 +1891,7 @@ impl FractionalPrinter {
     /// when choosing what designator to use.
     fn is_plural(&self) -> bool {
         self.integer != 1
-            || (self.fraction != 0
-                && !self.fmtfraction.has_zero_fixed_precision())
+            || (self.fraction != 0 && !self.has_zero_fixed_precision())
     }
 
     /// Returns true if and only if this printer must write some kind of number
@@ -1711,7 +1901,32 @@ impl FractionalPrinter {
     /// fractional component are zero *and* the precision is fixed to a number
     /// greater than zero.
     fn must_write_digits(&self) -> bool {
-        !self.is_zero() || self.fmtfraction.has_non_zero_fixed_precision()
+        !self.is_zero() || self.has_non_zero_fixed_precision()
+    }
+
+    /// Returns true if and only if at least one digit will be written for the
+    /// given value.
+    ///
+    /// This is useful for callers that need to know whether to write
+    /// a decimal separator, e.g., `.`, before the digits.
+    fn will_write_digits(&self) -> bool {
+        self.precision.map_or_else(|| self.fraction != 0, |p| p > 0)
+    }
+
+    /// Returns true if and only if this formatter has an explicit non-zero
+    /// precision setting.
+    ///
+    /// This is useful for determining whether something like `0.000` needs to
+    /// be written in the case of a `precision=Some(3)` setting and a zero
+    /// value.
+    fn has_non_zero_fixed_precision(&self) -> bool {
+        self.precision.map_or(false, |p| p > 0)
+    }
+
+    /// Returns true if and only if this formatter has fixed zero precision.
+    /// That is, no matter what is given as input, a fraction is never written.
+    fn has_zero_fixed_precision(&self) -> bool {
+        self.precision.map_or(false, |p| p == 0)
     }
 
     /// Prints the integer and optional fractional component.
@@ -1719,13 +1934,12 @@ impl FractionalPrinter {
     /// This will always print the integer, even if it's zero. Therefore, if
     /// the caller wants to omit printing zero, the caller should do their own
     /// conditional logic.
-    fn print<W: Write>(&self, mut wtr: W) -> Result<(), Error> {
-        wtr.write_int(&self.fmtint, self.integer)?;
-        if self.fmtfraction.will_write_digits(self.fraction) {
-            wtr.write_str(".")?;
-            wtr.write_fraction(&self.fmtfraction, self.fraction)?;
+    fn print(&self, bbuf: &mut BorrowedBuffer<'_>) {
+        bbuf.write_int_pad(self.integer, b'0', self.padding);
+        if self.will_write_digits() {
+            bbuf.write_ascii_char(b'.');
+            bbuf.write_fraction(self.precision, self.fraction);
         }
-        Ok(())
     }
 }
 
@@ -2292,7 +2506,7 @@ mod tests {
     }
 
     #[test]
-    fn print_duration_designator_default() {
+    fn print_signed_duration_designator_default() {
         let printer = || SpanPrinter::new();
         let p = |secs| {
             printer().duration_to_string(&SignedDuration::from_secs(secs))
@@ -2335,7 +2549,7 @@ mod tests {
     }
 
     #[test]
-    fn print_duration_designator_verbose() {
+    fn print_signed_duration_designator_verbose() {
         let printer = || SpanPrinter::new().designator(Designator::Verbose);
         let p = |secs| {
             printer().duration_to_string(&SignedDuration::from_secs(secs))
@@ -2378,7 +2592,7 @@ mod tests {
     }
 
     #[test]
-    fn print_duration_designator_short() {
+    fn print_signed_duration_designator_short() {
         let printer = || SpanPrinter::new().designator(Designator::Short);
         let p = |secs| {
             printer().duration_to_string(&SignedDuration::from_secs(secs))
@@ -2421,7 +2635,7 @@ mod tests {
     }
 
     #[test]
-    fn print_duration_designator_compact() {
+    fn print_signed_duration_designator_compact() {
         let printer = || SpanPrinter::new().designator(Designator::Compact);
         let p = |secs| {
             printer().duration_to_string(&SignedDuration::from_secs(secs))
@@ -2464,7 +2678,7 @@ mod tests {
     }
 
     #[test]
-    fn print_duration_designator_direction_force() {
+    fn print_signed_duration_designator_direction_force() {
         let printer = || SpanPrinter::new().direction(Direction::ForceSign);
         let p = |secs| {
             printer().duration_to_string(&SignedDuration::from_secs(secs))
@@ -2507,7 +2721,7 @@ mod tests {
     }
 
     #[test]
-    fn print_duration_designator_padding() {
+    fn print_signed_duration_designator_padding() {
         let printer = || SpanPrinter::new().padding(2);
         let p = |secs| {
             printer().duration_to_string(&SignedDuration::from_secs(secs))
@@ -2550,7 +2764,7 @@ mod tests {
     }
 
     #[test]
-    fn print_duration_designator_spacing_none() {
+    fn print_signed_duration_designator_spacing_none() {
         let printer = || SpanPrinter::new().spacing(Spacing::None);
         let p = |secs| {
             printer().duration_to_string(&SignedDuration::from_secs(secs))
@@ -2593,7 +2807,7 @@ mod tests {
     }
 
     #[test]
-    fn print_duration_designator_spacing_more() {
+    fn print_signed_duration_designator_spacing_more() {
         let printer =
             || SpanPrinter::new().spacing(Spacing::BetweenUnitsAndDesignators);
         let p = |secs| {
@@ -2637,7 +2851,7 @@ mod tests {
     }
 
     #[test]
-    fn print_duration_designator_spacing_comma() {
+    fn print_signed_duration_designator_spacing_comma() {
         let printer = || {
             SpanPrinter::new()
                 .comma_after_designator(true)
@@ -2684,7 +2898,7 @@ mod tests {
     }
 
     #[test]
-    fn print_duration_designator_fractional_hour() {
+    fn print_signed_duration_designator_fractional_hour() {
         let printer =
             || SpanPrinter::new().fractional(Some(FractionalUnit::Hour));
         let p = |secs, nanos| {
@@ -2722,7 +2936,7 @@ mod tests {
     }
 
     #[test]
-    fn print_duration_designator_fractional_minute() {
+    fn print_signed_duration_designator_fractional_minute() {
         let printer =
             || SpanPrinter::new().fractional(Some(FractionalUnit::Minute));
         let p = |secs, nanos| {
@@ -2764,7 +2978,7 @@ mod tests {
     }
 
     #[test]
-    fn print_duration_designator_fractional_second() {
+    fn print_signed_duration_designator_fractional_second() {
         let printer =
             || SpanPrinter::new().fractional(Some(FractionalUnit::Second));
         let p = |secs, nanos| {
@@ -2800,7 +3014,7 @@ mod tests {
     }
 
     #[test]
-    fn print_duration_designator_fractional_millisecond() {
+    fn print_signed_duration_designator_fractional_millisecond() {
         let printer = || {
             SpanPrinter::new().fractional(Some(FractionalUnit::Millisecond))
         };
@@ -2841,7 +3055,7 @@ mod tests {
     }
 
     #[test]
-    fn print_duration_designator_fractional_microsecond() {
+    fn print_signed_duration_designator_fractional_microsecond() {
         let printer = || {
             SpanPrinter::new().fractional(Some(FractionalUnit::Microsecond))
         };
@@ -2879,6 +3093,572 @@ mod tests {
             printer().duration_to_string(&SignedDuration::MIN),
             @"2562047788015215h 30m 8s 999ms 999.999µs ago",
         );
+    }
+
+    #[test]
+    fn print_unsigned_duration_designator_default() {
+        let printer = || SpanPrinter::new();
+        let p = |secs| {
+            printer().unsigned_duration_to_string(
+                &core::time::Duration::from_secs(secs),
+            )
+        };
+
+        insta::assert_snapshot!(p(1), @"1s");
+        insta::assert_snapshot!(p(2), @"2s");
+        insta::assert_snapshot!(p(10), @"10s");
+        insta::assert_snapshot!(p(100), @"1m 40s");
+
+        insta::assert_snapshot!(p(1 * 60), @"1m");
+        insta::assert_snapshot!(p(2 * 60), @"2m");
+        insta::assert_snapshot!(p(10 * 60), @"10m");
+        insta::assert_snapshot!(p(100 * 60), @"1h 40m");
+
+        insta::assert_snapshot!(p(1 * 60 * 60), @"1h");
+        insta::assert_snapshot!(p(2 * 60 * 60), @"2h");
+        insta::assert_snapshot!(p(10 * 60 * 60), @"10h");
+        insta::assert_snapshot!(p(100 * 60 * 60), @"100h");
+
+        insta::assert_snapshot!(
+            p(60 * 60 + 60 + 1),
+            @"1h 1m 1s",
+        );
+        insta::assert_snapshot!(
+            p(2 * 60 * 60 + 2 * 60 + 2),
+            @"2h 2m 2s",
+        );
+        insta::assert_snapshot!(
+            p(10 * 60 * 60 + 10 * 60 + 10),
+            @"10h 10m 10s",
+        );
+        insta::assert_snapshot!(
+            p(100 * 60 * 60 + 100 * 60 + 100),
+            @"101h 41m 40s",
+        );
+    }
+
+    #[test]
+    fn print_unsigned_duration_designator_verbose() {
+        let printer = || SpanPrinter::new().designator(Designator::Verbose);
+        let p = |secs| {
+            printer().unsigned_duration_to_string(
+                &core::time::Duration::from_secs(secs),
+            )
+        };
+
+        insta::assert_snapshot!(p(1), @"1second");
+        insta::assert_snapshot!(p(2), @"2seconds");
+        insta::assert_snapshot!(p(10), @"10seconds");
+        insta::assert_snapshot!(p(100), @"1minute 40seconds");
+
+        insta::assert_snapshot!(p(1 * 60), @"1minute");
+        insta::assert_snapshot!(p(2 * 60), @"2minutes");
+        insta::assert_snapshot!(p(10 * 60), @"10minutes");
+        insta::assert_snapshot!(p(100 * 60), @"1hour 40minutes");
+
+        insta::assert_snapshot!(p(1 * 60 * 60), @"1hour");
+        insta::assert_snapshot!(p(2 * 60 * 60), @"2hours");
+        insta::assert_snapshot!(p(10 * 60 * 60), @"10hours");
+        insta::assert_snapshot!(p(100 * 60 * 60), @"100hours");
+
+        insta::assert_snapshot!(
+            p(60 * 60 + 60 + 1),
+            @"1hour 1minute 1second",
+        );
+        insta::assert_snapshot!(
+            p(2 * 60 * 60 + 2 * 60 + 2),
+            @"2hours 2minutes 2seconds",
+        );
+        insta::assert_snapshot!(
+            p(10 * 60 * 60 + 10 * 60 + 10),
+            @"10hours 10minutes 10seconds",
+        );
+        insta::assert_snapshot!(
+            p(100 * 60 * 60 + 100 * 60 + 100),
+            @"101hours 41minutes 40seconds",
+        );
+    }
+
+    #[test]
+    fn print_unsigned_duration_designator_short() {
+        let printer = || SpanPrinter::new().designator(Designator::Short);
+        let p = |secs| {
+            printer().unsigned_duration_to_string(
+                &core::time::Duration::from_secs(secs),
+            )
+        };
+
+        insta::assert_snapshot!(p(1), @"1sec");
+        insta::assert_snapshot!(p(2), @"2secs");
+        insta::assert_snapshot!(p(10), @"10secs");
+        insta::assert_snapshot!(p(100), @"1min 40secs");
+
+        insta::assert_snapshot!(p(1 * 60), @"1min");
+        insta::assert_snapshot!(p(2 * 60), @"2mins");
+        insta::assert_snapshot!(p(10 * 60), @"10mins");
+        insta::assert_snapshot!(p(100 * 60), @"1hr 40mins");
+
+        insta::assert_snapshot!(p(1 * 60 * 60), @"1hr");
+        insta::assert_snapshot!(p(2 * 60 * 60), @"2hrs");
+        insta::assert_snapshot!(p(10 * 60 * 60), @"10hrs");
+        insta::assert_snapshot!(p(100 * 60 * 60), @"100hrs");
+
+        insta::assert_snapshot!(
+            p(60 * 60 + 60 + 1),
+            @"1hr 1min 1sec",
+        );
+        insta::assert_snapshot!(
+            p(2 * 60 * 60 + 2 * 60 + 2),
+            @"2hrs 2mins 2secs",
+        );
+        insta::assert_snapshot!(
+            p(10 * 60 * 60 + 10 * 60 + 10),
+            @"10hrs 10mins 10secs",
+        );
+        insta::assert_snapshot!(
+            p(100 * 60 * 60 + 100 * 60 + 100),
+            @"101hrs 41mins 40secs",
+        );
+    }
+
+    #[test]
+    fn print_unsigned_duration_designator_compact() {
+        let printer = || SpanPrinter::new().designator(Designator::Compact);
+        let p = |secs| {
+            printer().unsigned_duration_to_string(
+                &core::time::Duration::from_secs(secs),
+            )
+        };
+
+        insta::assert_snapshot!(p(1), @"1s");
+        insta::assert_snapshot!(p(2), @"2s");
+        insta::assert_snapshot!(p(10), @"10s");
+        insta::assert_snapshot!(p(100), @"1m 40s");
+
+        insta::assert_snapshot!(p(1 * 60), @"1m");
+        insta::assert_snapshot!(p(2 * 60), @"2m");
+        insta::assert_snapshot!(p(10 * 60), @"10m");
+        insta::assert_snapshot!(p(100 * 60), @"1h 40m");
+
+        insta::assert_snapshot!(p(1 * 60 * 60), @"1h");
+        insta::assert_snapshot!(p(2 * 60 * 60), @"2h");
+        insta::assert_snapshot!(p(10 * 60 * 60), @"10h");
+        insta::assert_snapshot!(p(100 * 60 * 60), @"100h");
+
+        insta::assert_snapshot!(
+            p(60 * 60 + 60 + 1),
+            @"1h 1m 1s",
+        );
+        insta::assert_snapshot!(
+            p(2 * 60 * 60 + 2 * 60 + 2),
+            @"2h 2m 2s",
+        );
+        insta::assert_snapshot!(
+            p(10 * 60 * 60 + 10 * 60 + 10),
+            @"10h 10m 10s",
+        );
+        insta::assert_snapshot!(
+            p(100 * 60 * 60 + 100 * 60 + 100),
+            @"101h 41m 40s",
+        );
+    }
+
+    #[test]
+    fn print_unsigned_duration_designator_direction_force() {
+        let printer = || SpanPrinter::new().direction(Direction::ForceSign);
+        let p = |secs| {
+            printer().unsigned_duration_to_string(
+                &core::time::Duration::from_secs(secs),
+            )
+        };
+
+        insta::assert_snapshot!(p(1), @"+1s");
+        insta::assert_snapshot!(p(2), @"+2s");
+        insta::assert_snapshot!(p(10), @"+10s");
+        insta::assert_snapshot!(p(100), @"+1m 40s");
+
+        insta::assert_snapshot!(p(1 * 60), @"+1m");
+        insta::assert_snapshot!(p(2 * 60), @"+2m");
+        insta::assert_snapshot!(p(10 * 60), @"+10m");
+        insta::assert_snapshot!(p(100 * 60), @"+1h 40m");
+
+        insta::assert_snapshot!(p(1 * 60 * 60), @"+1h");
+        insta::assert_snapshot!(p(2 * 60 * 60), @"+2h");
+        insta::assert_snapshot!(p(10 * 60 * 60), @"+10h");
+        insta::assert_snapshot!(p(100 * 60 * 60), @"+100h");
+
+        insta::assert_snapshot!(
+            p(60 * 60 + 60 + 1),
+            @"+1h 1m 1s",
+        );
+        insta::assert_snapshot!(
+            p(2 * 60 * 60 + 2 * 60 + 2),
+            @"+2h 2m 2s",
+        );
+        insta::assert_snapshot!(
+            p(10 * 60 * 60 + 10 * 60 + 10),
+            @"+10h 10m 10s",
+        );
+        insta::assert_snapshot!(
+            p(100 * 60 * 60 + 100 * 60 + 100),
+            @"+101h 41m 40s",
+        );
+    }
+
+    #[test]
+    fn print_unsigned_duration_designator_padding() {
+        let printer = || SpanPrinter::new().padding(2);
+        let p = |secs| {
+            printer().unsigned_duration_to_string(
+                &core::time::Duration::from_secs(secs),
+            )
+        };
+
+        insta::assert_snapshot!(p(1), @"01s");
+        insta::assert_snapshot!(p(2), @"02s");
+        insta::assert_snapshot!(p(10), @"10s");
+        insta::assert_snapshot!(p(100), @"01m 40s");
+
+        insta::assert_snapshot!(p(1 * 60), @"01m");
+        insta::assert_snapshot!(p(2 * 60), @"02m");
+        insta::assert_snapshot!(p(10 * 60), @"10m");
+        insta::assert_snapshot!(p(100 * 60), @"01h 40m");
+
+        insta::assert_snapshot!(p(1 * 60 * 60), @"01h");
+        insta::assert_snapshot!(p(2 * 60 * 60), @"02h");
+        insta::assert_snapshot!(p(10 * 60 * 60), @"10h");
+        insta::assert_snapshot!(p(100 * 60 * 60), @"100h");
+
+        insta::assert_snapshot!(
+            p(60 * 60 + 60 + 1),
+            @"01h 01m 01s",
+        );
+        insta::assert_snapshot!(
+            p(2 * 60 * 60 + 2 * 60 + 2),
+            @"02h 02m 02s",
+        );
+        insta::assert_snapshot!(
+            p(10 * 60 * 60 + 10 * 60 + 10),
+            @"10h 10m 10s",
+        );
+        insta::assert_snapshot!(
+            p(100 * 60 * 60 + 100 * 60 + 100),
+            @"101h 41m 40s",
+        );
+    }
+
+    #[test]
+    fn print_unsigned_duration_designator_spacing_none() {
+        let printer = || SpanPrinter::new().spacing(Spacing::None);
+        let p = |secs| {
+            printer().unsigned_duration_to_string(
+                &core::time::Duration::from_secs(secs),
+            )
+        };
+
+        insta::assert_snapshot!(p(1), @"1s");
+        insta::assert_snapshot!(p(2), @"2s");
+        insta::assert_snapshot!(p(10), @"10s");
+        insta::assert_snapshot!(p(100), @"1m40s");
+
+        insta::assert_snapshot!(p(1 * 60), @"1m");
+        insta::assert_snapshot!(p(2 * 60), @"2m");
+        insta::assert_snapshot!(p(10 * 60), @"10m");
+        insta::assert_snapshot!(p(100 * 60), @"1h40m");
+
+        insta::assert_snapshot!(p(1 * 60 * 60), @"1h");
+        insta::assert_snapshot!(p(2 * 60 * 60), @"2h");
+        insta::assert_snapshot!(p(10 * 60 * 60), @"10h");
+        insta::assert_snapshot!(p(100 * 60 * 60), @"100h");
+
+        insta::assert_snapshot!(
+            p(60 * 60 + 60 + 1),
+            @"1h1m1s",
+        );
+        insta::assert_snapshot!(
+            p(2 * 60 * 60 + 2 * 60 + 2),
+            @"2h2m2s",
+        );
+        insta::assert_snapshot!(
+            p(10 * 60 * 60 + 10 * 60 + 10),
+            @"10h10m10s",
+        );
+        insta::assert_snapshot!(
+            p(100 * 60 * 60 + 100 * 60 + 100),
+            @"101h41m40s",
+        );
+    }
+
+    #[test]
+    fn print_unsigned_duration_designator_spacing_more() {
+        let printer =
+            || SpanPrinter::new().spacing(Spacing::BetweenUnitsAndDesignators);
+        let p = |secs| {
+            printer().unsigned_duration_to_string(
+                &core::time::Duration::from_secs(secs),
+            )
+        };
+
+        insta::assert_snapshot!(p(1), @"1 s");
+        insta::assert_snapshot!(p(2), @"2 s");
+        insta::assert_snapshot!(p(10), @"10 s");
+        insta::assert_snapshot!(p(100), @"1 m 40 s");
+
+        insta::assert_snapshot!(p(1 * 60), @"1 m");
+        insta::assert_snapshot!(p(2 * 60), @"2 m");
+        insta::assert_snapshot!(p(10 * 60), @"10 m");
+        insta::assert_snapshot!(p(100 * 60), @"1 h 40 m");
+
+        insta::assert_snapshot!(p(1 * 60 * 60), @"1 h");
+        insta::assert_snapshot!(p(2 * 60 * 60), @"2 h");
+        insta::assert_snapshot!(p(10 * 60 * 60), @"10 h");
+        insta::assert_snapshot!(p(100 * 60 * 60), @"100 h");
+
+        insta::assert_snapshot!(
+            p(60 * 60 + 60 + 1),
+            @"1 h 1 m 1 s",
+        );
+        insta::assert_snapshot!(
+            p(2 * 60 * 60 + 2 * 60 + 2),
+            @"2 h 2 m 2 s",
+        );
+        insta::assert_snapshot!(
+            p(10 * 60 * 60 + 10 * 60 + 10),
+            @"10 h 10 m 10 s",
+        );
+        insta::assert_snapshot!(
+            p(100 * 60 * 60 + 100 * 60 + 100),
+            @"101 h 41 m 40 s",
+        );
+    }
+
+    #[test]
+    fn print_unsigned_duration_designator_spacing_comma() {
+        let printer = || {
+            SpanPrinter::new()
+                .comma_after_designator(true)
+                .spacing(Spacing::BetweenUnitsAndDesignators)
+        };
+        let p = |secs| {
+            printer().unsigned_duration_to_string(
+                &core::time::Duration::from_secs(secs),
+            )
+        };
+
+        insta::assert_snapshot!(p(1), @"1 s");
+        insta::assert_snapshot!(p(2), @"2 s");
+        insta::assert_snapshot!(p(10), @"10 s");
+        insta::assert_snapshot!(p(100), @"1 m, 40 s");
+
+        insta::assert_snapshot!(p(1 * 60), @"1 m");
+        insta::assert_snapshot!(p(2 * 60), @"2 m");
+        insta::assert_snapshot!(p(10 * 60), @"10 m");
+        insta::assert_snapshot!(p(100 * 60), @"1 h, 40 m");
+
+        insta::assert_snapshot!(p(1 * 60 * 60), @"1 h");
+        insta::assert_snapshot!(p(2 * 60 * 60), @"2 h");
+        insta::assert_snapshot!(p(10 * 60 * 60), @"10 h");
+        insta::assert_snapshot!(p(100 * 60 * 60), @"100 h");
+
+        insta::assert_snapshot!(
+            p(60 * 60 + 60 + 1),
+            @"1 h, 1 m, 1 s",
+        );
+        insta::assert_snapshot!(
+            p(2 * 60 * 60 + 2 * 60 + 2),
+            @"2 h, 2 m, 2 s",
+        );
+        insta::assert_snapshot!(
+            p(10 * 60 * 60 + 10 * 60 + 10),
+            @"10 h, 10 m, 10 s",
+        );
+        insta::assert_snapshot!(
+            p(100 * 60 * 60 + 100 * 60 + 100),
+            @"101 h, 41 m, 40 s",
+        );
+    }
+
+    #[test]
+    fn print_unsigned_duration_designator_fractional_hour() {
+        let printer =
+            || SpanPrinter::new().fractional(Some(FractionalUnit::Hour));
+        let p = |secs, nanos| {
+            printer().unsigned_duration_to_string(&core::time::Duration::new(
+                secs, nanos,
+            ))
+        };
+        let pp = |precision, secs, nanos| {
+            printer()
+                .precision(Some(precision))
+                .duration_to_string(&SignedDuration::new(secs, nanos))
+        };
+
+        insta::assert_snapshot!(p(1 * 60 * 60, 0), @"1h");
+        insta::assert_snapshot!(pp(0, 1 * 60 * 60, 0), @"1h");
+        insta::assert_snapshot!(pp(1, 1 * 60 * 60, 0), @"1.0h");
+        insta::assert_snapshot!(pp(2, 1 * 60 * 60, 0), @"1.00h");
+
+        insta::assert_snapshot!(p(1 * 60 * 60 + 30 * 60, 0), @"1.5h");
+        insta::assert_snapshot!(pp(0, 1 * 60 * 60 + 30 * 60, 0), @"1h");
+        insta::assert_snapshot!(pp(1, 1 * 60 * 60 + 30 * 60, 0), @"1.5h");
+        insta::assert_snapshot!(pp(2, 1 * 60 * 60 + 30 * 60, 0), @"1.50h");
+
+        insta::assert_snapshot!(p(1 * 60 * 60 + 3 * 60, 0), @"1.05h");
+        insta::assert_snapshot!(p(1 * 60 * 60 + 3 * 60, 1), @"1.05h");
+        insta::assert_snapshot!(p(1, 0), @"0.000277777h");
+        // precision loss!
+        insta::assert_snapshot!(p(1, 1), @"0.000277777h");
+        insta::assert_snapshot!(p(0, 0), @"0h");
+        // precision loss!
+        insta::assert_snapshot!(p(0, 1), @"0h");
+    }
+
+    #[test]
+    fn print_unsigned_duration_designator_fractional_minute() {
+        let printer =
+            || SpanPrinter::new().fractional(Some(FractionalUnit::Minute));
+        let p = |secs, nanos| {
+            printer().unsigned_duration_to_string(&core::time::Duration::new(
+                secs, nanos,
+            ))
+        };
+        let pp = |precision, secs, nanos| {
+            printer()
+                .precision(Some(precision))
+                .duration_to_string(&SignedDuration::new(secs, nanos))
+        };
+
+        insta::assert_snapshot!(p(1 * 60 * 60, 0), @"1h");
+        insta::assert_snapshot!(p(1 * 60 * 60 + 30 * 60, 0), @"1h 30m");
+
+        insta::assert_snapshot!(p(60, 0), @"1m");
+        insta::assert_snapshot!(pp(0, 60, 0), @"1m");
+        insta::assert_snapshot!(pp(1, 60, 0), @"1.0m");
+        insta::assert_snapshot!(pp(2, 60, 0), @"1.00m");
+
+        insta::assert_snapshot!(p(90, 0), @"1.5m");
+        insta::assert_snapshot!(pp(0, 90, 0), @"1m");
+        insta::assert_snapshot!(pp(1, 90, 0), @"1.5m");
+        insta::assert_snapshot!(pp(2, 90, 0), @"1.50m");
+
+        insta::assert_snapshot!(p(1 * 60 * 60, 1), @"1h");
+        insta::assert_snapshot!(p(63, 0), @"1.05m");
+        insta::assert_snapshot!(p(63, 1), @"1.05m");
+        insta::assert_snapshot!(p(1, 0), @"0.016666666m");
+        // precision loss!
+        insta::assert_snapshot!(p(1, 1), @"0.016666666m");
+        insta::assert_snapshot!(p(0, 0), @"0m");
+        // precision loss!
+        insta::assert_snapshot!(p(0, 1), @"0m");
+    }
+
+    #[test]
+    fn print_unsigned_duration_designator_fractional_second() {
+        let printer =
+            || SpanPrinter::new().fractional(Some(FractionalUnit::Second));
+        let p = |secs, nanos| {
+            printer().unsigned_duration_to_string(&core::time::Duration::new(
+                secs, nanos,
+            ))
+        };
+        let pp = |precision, secs, nanos| {
+            printer()
+                .precision(Some(precision))
+                .duration_to_string(&SignedDuration::new(secs, nanos))
+        };
+
+        insta::assert_snapshot!(p(1 * 60 * 60, 0), @"1h");
+        insta::assert_snapshot!(p(1 * 60 * 60 + 30 * 60, 0), @"1h 30m");
+
+        insta::assert_snapshot!(p(1, 0), @"1s");
+        insta::assert_snapshot!(pp(0, 1, 0), @"1s");
+        insta::assert_snapshot!(pp(1, 1, 0), @"1.0s");
+        insta::assert_snapshot!(pp(2, 1, 0), @"1.00s");
+
+        insta::assert_snapshot!(p(1, 500_000_000), @"1.5s");
+        insta::assert_snapshot!(pp(0, 1, 500_000_000), @"1s");
+        insta::assert_snapshot!(pp(1, 1, 500_000_000), @"1.5s");
+        insta::assert_snapshot!(pp(2, 1, 500_000_000), @"1.50s");
+
+        insta::assert_snapshot!(p(1, 1), @"1.000000001s");
+        insta::assert_snapshot!(p(0, 1), @"0.000000001s");
+        insta::assert_snapshot!(p(0, 0), @"0s");
+    }
+
+    #[test]
+    fn print_unsigned_duration_designator_fractional_millisecond() {
+        let printer = || {
+            SpanPrinter::new().fractional(Some(FractionalUnit::Millisecond))
+        };
+        let p = |secs, nanos| {
+            printer().unsigned_duration_to_string(&core::time::Duration::new(
+                secs, nanos,
+            ))
+        };
+        let pp = |precision, secs, nanos| {
+            printer()
+                .precision(Some(precision))
+                .duration_to_string(&SignedDuration::new(secs, nanos))
+        };
+
+        insta::assert_snapshot!(p(1 * 60 * 60, 0), @"1h");
+        insta::assert_snapshot!(p(1 * 60 * 60 + 30 * 60, 0), @"1h 30m");
+        insta::assert_snapshot!(
+            p(1 * 60 * 60 + 30 * 60 + 10, 0),
+            @"1h 30m 10s",
+        );
+
+        insta::assert_snapshot!(p(1, 0), @"1s");
+        insta::assert_snapshot!(pp(0, 1, 0), @"1s");
+        insta::assert_snapshot!(pp(1, 1, 0), @"1s 0.0ms");
+        insta::assert_snapshot!(pp(2, 1, 0), @"1s 0.00ms");
+
+        insta::assert_snapshot!(p(1, 500_000_000), @"1s 500ms");
+        insta::assert_snapshot!(pp(0, 1, 1_500_000), @"1s 1ms");
+        insta::assert_snapshot!(pp(1, 1, 1_500_000), @"1s 1.5ms");
+        insta::assert_snapshot!(pp(2, 1, 1_500_000), @"1s 1.50ms");
+
+        insta::assert_snapshot!(p(0, 1_000_001), @"1.000001ms");
+        insta::assert_snapshot!(p(0, 0_000_001), @"0.000001ms");
+        insta::assert_snapshot!(p(0, 0), @"0ms");
+    }
+
+    #[test]
+    fn print_unsigned_duration_designator_fractional_microsecond() {
+        let printer = || {
+            SpanPrinter::new().fractional(Some(FractionalUnit::Microsecond))
+        };
+        let p = |secs, nanos| {
+            printer().unsigned_duration_to_string(&core::time::Duration::new(
+                secs, nanos,
+            ))
+        };
+        let pp = |precision, secs, nanos| {
+            printer().precision(Some(precision)).unsigned_duration_to_string(
+                &core::time::Duration::new(secs, nanos),
+            )
+        };
+
+        insta::assert_snapshot!(p(1 * 60 * 60, 0), @"1h");
+        insta::assert_snapshot!(p(1 * 60 * 60 + 30 * 60, 0), @"1h 30m");
+        insta::assert_snapshot!(
+            p(1 * 60 * 60 + 30 * 60 + 10, 0),
+            @"1h 30m 10s",
+        );
+
+        insta::assert_snapshot!(p(1, 0), @"1s");
+        insta::assert_snapshot!(pp(0, 1, 0), @"1s");
+        insta::assert_snapshot!(pp(1, 1, 0), @"1s 0.0µs");
+        insta::assert_snapshot!(pp(2, 1, 0), @"1s 0.00µs");
+
+        insta::assert_snapshot!(p(1, 500_000_000), @"1s 500ms");
+        insta::assert_snapshot!(pp(0, 1, 1_500_000), @"1s 1ms 500µs");
+        insta::assert_snapshot!(pp(1, 1, 1_500_000), @"1s 1ms 500.0µs");
+        insta::assert_snapshot!(pp(2, 1, 1_500_000), @"1s 1ms 500.00µs");
+
+        insta::assert_snapshot!(p(0, 1_000_001), @"1ms 0.001µs");
+        insta::assert_snapshot!(p(0, 0_000_001), @"0.001µs");
+        insta::assert_snapshot!(p(0, 0), @"0µs");
     }
 
     #[test]
@@ -3093,7 +3873,7 @@ mod tests {
     }
 
     #[test]
-    fn print_duration_hms() {
+    fn print_signed_duration_hms() {
         let printer = || SpanPrinter::new().hours_minutes_seconds(true);
         let p = |secs| {
             printer().duration_to_string(&SignedDuration::from_secs(secs))
@@ -3136,7 +3916,7 @@ mod tests {
     }
 
     #[test]
-    fn print_duration_hms_sign() {
+    fn print_signed_duration_hms_sign() {
         let printer = |direction| {
             SpanPrinter::new().hours_minutes_seconds(true).direction(direction)
         };
@@ -3157,7 +3937,7 @@ mod tests {
     }
 
     #[test]
-    fn print_duration_hms_fraction_auto() {
+    fn print_signed_duration_hms_fraction_auto() {
         let printer = || SpanPrinter::new().hours_minutes_seconds(true);
         let p = |secs, nanos| {
             printer().duration_to_string(&SignedDuration::new(secs, nanos))
@@ -3191,7 +3971,7 @@ mod tests {
     }
 
     #[test]
-    fn print_duration_hms_fraction_fixed_precision() {
+    fn print_signed_duration_hms_fraction_fixed_precision() {
         let printer = || SpanPrinter::new().hours_minutes_seconds(true);
         let p = |precision, secs, nanos| {
             printer()
@@ -3218,6 +3998,176 @@ mod tests {
         insta::assert_snapshot!(
             p(1, 1, 999_000_000),
             @"00:00:01.9",
+        );
+    }
+
+    #[test]
+    fn print_unsigned_duration_hms() {
+        let printer = || SpanPrinter::new().hours_minutes_seconds(true);
+        let p = |secs| {
+            printer().unsigned_duration_to_string(
+                &core::time::Duration::from_secs(secs),
+            )
+        };
+
+        // Note the differences with `Span`, since with a `Duration`,
+        // all units are balanced.
+
+        insta::assert_snapshot!(p(1), @"00:00:01");
+        insta::assert_snapshot!(p(2), @"00:00:02");
+        insta::assert_snapshot!(p(10), @"00:00:10");
+        insta::assert_snapshot!(p(100), @"00:01:40");
+
+        insta::assert_snapshot!(p(1 * 60), @"00:01:00");
+        insta::assert_snapshot!(p(2 * 60), @"00:02:00");
+        insta::assert_snapshot!(p(10 * 60), @"00:10:00");
+        insta::assert_snapshot!(p(100 * 60), @"01:40:00");
+
+        insta::assert_snapshot!(p(1 * 60 * 60), @"01:00:00");
+        insta::assert_snapshot!(p(2 * 60 * 60), @"02:00:00");
+        insta::assert_snapshot!(p(10 * 60 * 60), @"10:00:00");
+        insta::assert_snapshot!(p(100 * 60 * 60), @"100:00:00");
+
+        insta::assert_snapshot!(
+            p(60 * 60 + 60 + 1),
+            @"01:01:01",
+        );
+        insta::assert_snapshot!(
+            p(2 * 60 * 60 + 2 * 60 + 2),
+            @"02:02:02",
+        );
+        insta::assert_snapshot!(
+            p(10 * 60 * 60 + 10 * 60 + 10),
+            @"10:10:10",
+        );
+        insta::assert_snapshot!(
+            p(100 * 60 * 60 + 100 * 60 + 100),
+            @"101:41:40",
+        );
+    }
+
+    #[test]
+    fn print_unsigned_duration_hms_sign() {
+        let printer = |direction| {
+            SpanPrinter::new().hours_minutes_seconds(true).direction(direction)
+        };
+        let p = |direction, secs| {
+            printer(direction).unsigned_duration_to_string(
+                &core::time::Duration::from_secs(secs),
+            )
+        };
+
+        insta::assert_snapshot!(p(Direction::Auto, 1), @"00:00:01");
+        insta::assert_snapshot!(p(Direction::Sign, 1), @"00:00:01");
+        insta::assert_snapshot!(p(Direction::ForceSign, 1), @"+00:00:01");
+        insta::assert_snapshot!(p(Direction::Suffix, 1), @"00:00:01");
+    }
+
+    #[test]
+    fn print_unsigned_duration_hms_fraction_auto() {
+        let printer = || SpanPrinter::new().hours_minutes_seconds(true);
+        let p = |secs, nanos| {
+            printer().unsigned_duration_to_string(&core::time::Duration::new(
+                secs, nanos,
+            ))
+        };
+
+        insta::assert_snapshot!(p(0, 1), @"00:00:00.000000001");
+        insta::assert_snapshot!(
+            printer().direction(Direction::ForceSign).duration_to_string(
+                &SignedDuration::new(0, 1),
+            ),
+            @"+00:00:00.000000001",
+        );
+
+        insta::assert_snapshot!(
+            p(1, 123),
+            @"00:00:01.000000123",
+        );
+        insta::assert_snapshot!(
+            p(1, 123_000_000),
+            @"00:00:01.123",
+        );
+        insta::assert_snapshot!(
+            p(1, 1_123_000_000),
+            @"00:00:02.123",
+        );
+        insta::assert_snapshot!(
+            p(61, 1_123_000_000),
+            @"00:01:02.123",
+        );
+    }
+
+    #[test]
+    fn print_unsigned_duration_hms_fraction_fixed_precision() {
+        let printer = || SpanPrinter::new().hours_minutes_seconds(true);
+        let p = |precision, secs, nanos| {
+            printer().precision(Some(precision)).unsigned_duration_to_string(
+                &core::time::Duration::new(secs, nanos),
+            )
+        };
+
+        insta::assert_snapshot!(p(3, 1, 0), @"00:00:01.000");
+        insta::assert_snapshot!(
+            p(3, 1, 1_000_000),
+            @"00:00:01.001",
+        );
+        insta::assert_snapshot!(
+            p(3, 1, 123_000_000),
+            @"00:00:01.123",
+        );
+        insta::assert_snapshot!(
+            p(3, 1, 100_000_000),
+            @"00:00:01.100",
+        );
+
+        insta::assert_snapshot!(p(0, 1, 0), @"00:00:01");
+        insta::assert_snapshot!(p(0, 1, 1_000_000), @"00:00:01");
+        insta::assert_snapshot!(
+            p(1, 1, 999_000_000),
+            @"00:00:01.9",
+        );
+    }
+
+    /// Tests that we can write the maximal string successfully.
+    ///
+    /// This test doesn't guarantee that we'll always attempt the true
+    /// maximum. The maximums here were determined by human inspection.
+    #[test]
+    fn maximums() {
+        let p = SpanPrinter::new()
+            .padding(u8::MAX)
+            .designator(Designator::Verbose)
+            .spacing(Spacing::BetweenUnitsAndDesignators)
+            .comma_after_designator(true);
+
+        let span = -19_998
+            .year()
+            .months(239_976)
+            .weeks(1_043_497)
+            .days(7_304_484)
+            .hours(175_307_616)
+            .minutes(10_518_456_960i64)
+            .seconds(631_107_417_600i64)
+            .milliseconds(631_107_417_600_000i64)
+            .microseconds(631_107_416_600_000_000i64)
+            .nanoseconds(9_223_372_036_854_775_807i64);
+        insta::assert_snapshot!(
+            p.span_to_string(&span),
+            @"00000000000000019998 years, 00000000000000239976 months, 00000000000001043497 weeks, 00000000000007304484 days, 00000000000175307616 hours, 00000000010518456960 minutes, 00000000631107417600 seconds, 00000631107417600000 milliseconds, 00631107416600000000 microseconds, 09223372036854775807 nanoseconds ago",
+        );
+
+        let sdur = SignedDuration::MAX;
+        insta::assert_snapshot!(
+            p.duration_to_string(&sdur),
+            @"00002562047788015215 hours, 00000000000000000030 minutes, 00000000000000000007 seconds, 00000000000000000999 milliseconds, 00000000000000000999 microseconds, 00000000000000000999 nanoseconds",
+        );
+
+        let udur =
+            core::time::Duration::MAX - core::time::Duration::from_secs(16);
+        insta::assert_snapshot!(
+            p.unsigned_duration_to_string(&udur),
+            @"00005124095576030430 hours, 00000000000000000059 minutes, 00000000000000000059 seconds, 00000000000000000999 milliseconds, 00000000000000000999 microseconds, 00000000000000000999 nanoseconds",
         );
     }
 }

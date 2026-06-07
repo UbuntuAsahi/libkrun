@@ -6,10 +6,7 @@
 use std::num::NonZeroUsize;
 use std::sync::atomic::{AtomicU64, Ordering};
 
-use crate::bitmap::{Bitmap, RefSlice, WithBitmapSlice};
-
-#[cfg(feature = "backend-mmap")]
-use crate::mmap::NewBitmap;
+use crate::bitmap::{Bitmap, NewBitmap, RefSlice, WithBitmapSlice};
 
 /// `AtomicBitmap` implements a simple bit map on the page level with test and set operations.
 /// It is page-size aware, so it converts addresses to page numbers before setting or clearing
@@ -187,21 +184,20 @@ impl Bitmap for AtomicBitmap {
 impl Default for AtomicBitmap {
     fn default() -> Self {
         // SAFETY: Safe as `0x1000` is non-zero.
-        AtomicBitmap::new(0, unsafe { NonZeroUsize::new_unchecked(0x1000) })
+        AtomicBitmap::new(0, const { NonZeroUsize::new(0x1000).unwrap() })
     }
 }
 
-#[cfg(feature = "backend-mmap")]
 impl NewBitmap for AtomicBitmap {
     fn with_len(len: usize) -> Self {
-        #[cfg(unix)]
+        #[cfg(target_family = "unix")]
         // SAFETY: There's no unsafe potential in calling this function.
         let page_size = unsafe { libc::sysconf(libc::_SC_PAGE_SIZE) };
 
-        #[cfg(windows)]
+        #[cfg(target_family = "windows")]
         let page_size = {
-            use winapi::um::sysinfoapi::{GetSystemInfo, LPSYSTEM_INFO, SYSTEM_INFO};
-            let mut sysinfo = MaybeUninit::zeroed();
+            use winapi::um::sysinfoapi::GetSystemInfo;
+            let mut sysinfo = std::mem::MaybeUninit::zeroed();
             // SAFETY: It's safe to call `GetSystemInfo` as `sysinfo` is rightly sized
             // allocated memory.
             unsafe { GetSystemInfo(sysinfo.as_mut_ptr()) };
@@ -225,7 +221,7 @@ mod tests {
     use crate::bitmap::tests::test_bitmap;
 
     #[allow(clippy::undocumented_unsafe_blocks)]
-    const DEFAULT_PAGE_SIZE: NonZeroUsize = unsafe { NonZeroUsize::new_unchecked(128) };
+    const DEFAULT_PAGE_SIZE: NonZeroUsize = NonZeroUsize::new(128).unwrap();
 
     #[test]
     fn test_bitmap_basic() {

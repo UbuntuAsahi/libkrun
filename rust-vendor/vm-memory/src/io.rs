@@ -6,8 +6,31 @@
 use crate::bitmap::BitmapSlice;
 use crate::volatile_memory::copy_slice_impl::{copy_from_volatile_slice, copy_to_volatile_slice};
 use crate::{VolatileMemoryError, VolatileSlice};
-use std::io::{Cursor, ErrorKind, Stdout};
-use std::os::fd::AsRawFd;
+use std::io::{Cursor, ErrorKind};
+
+#[cfg(feature = "rawfd")]
+use std::io::Stdout;
+
+#[cfg(feature = "rawfd")]
+use std::os::fd::{AsFd, AsRawFd, BorrowedFd};
+
+macro_rules! retry_eintr {
+    ($io_call: expr) => {
+        loop {
+            let r = $io_call;
+
+            if let Err(crate::VolatileMemoryError::IOError(ref err)) = r {
+                if err.kind() == std::io::ErrorKind::Interrupted {
+                    continue;
+                }
+            }
+
+            break r;
+        }
+    };
+}
+
+pub(crate) use retry_eintr;
 
 /// A version of the standard library's [`Read`](std::io::Read) trait that operates on volatile
 /// memory instead of slices
@@ -39,10 +62,7 @@ pub trait ReadVolatile {
         let mut partial_buf = buf.offset(0)?;
 
         while !partial_buf.is_empty() {
-            match self.read_volatile(&mut partial_buf) {
-                Err(VolatileMemoryError::IOError(err)) if err.kind() == ErrorKind::Interrupted => {
-                    continue
-                }
+            match retry_eintr!(self.read_volatile(&mut partial_buf)) {
                 Ok(0) => {
                     return Err(VolatileMemoryError::IOError(std::io::Error::new(
                         ErrorKind::UnexpectedEof,
@@ -88,10 +108,7 @@ pub trait WriteVolatile {
         let mut partial_buf = buf.offset(0)?;
 
         while !partial_buf.is_empty() {
-            match self.write_volatile(&partial_buf) {
-                Err(VolatileMemoryError::IOError(err)) if err.kind() == ErrorKind::Interrupted => {
-                    continue
-                }
+            match retry_eintr!(self.write_volatile(&partial_buf)) {
                 Ok(0) => {
                     return Err(VolatileMemoryError::IOError(std::io::Error::new(
                         ErrorKind::WriteZero,
@@ -110,36 +127,89 @@ pub trait WriteVolatile {
 // We explicitly implement our traits for [`std::fs::File`] and [`std::os::unix::net::UnixStream`]
 // instead of providing blanket implementation for [`AsRawFd`] due to trait coherence limitations: A
 // blanket implementation would prevent us from providing implementations for `&mut [u8]` below, as
-// "an upstream crate could implement AsRawFd for &mut [u8]`.
+// "an upstream crate could implement AsRawFd for &mut [u8]".
 
 macro_rules! impl_read_write_volatile_for_raw_fd {
     ($raw_fd_ty:ty) => {
+        #[cfg(feature = "rawfd")]
         impl ReadVolatile for $raw_fd_ty {
             fn read_volatile<B: BitmapSlice>(
                 &mut self,
                 buf: &mut VolatileSlice<B>,
             ) -> Result<usize, VolatileMemoryError> {
-                read_volatile_raw_fd(self, buf)
+                read_volatile_raw_fd(self.as_fd(), buf)
             }
         }
 
+        #[cfg(feature = "rawfd")]
+        impl ReadVolatile for &$raw_fd_ty {
+            fn read_volatile<B: BitmapSlice>(
+                &mut self,
+                buf: &mut VolatileSlice<B>,
+            ) -> Result<usize, VolatileMemoryError> {
+                read_volatile_raw_fd(self.as_fd(), buf)
+            }
+        }
+
+        #[cfg(feature = "rawfd")]
+        impl ReadVolatile for &mut $raw_fd_ty {
+            fn read_volatile<B: BitmapSlice>(
+                &mut self,
+                buf: &mut VolatileSlice<B>,
+            ) -> Result<usize, VolatileMemoryError> {
+                read_volatile_raw_fd(self.as_fd(), buf)
+            }
+        }
+
+        #[cfg(feature = "rawfd")]
         impl WriteVolatile for $raw_fd_ty {
             fn write_volatile<B: BitmapSlice>(
                 &mut self,
                 buf: &VolatileSlice<B>,
             ) -> Result<usize, VolatileMemoryError> {
-                write_volatile_raw_fd(self, buf)
+                write_volatile_raw_fd(self.as_fd(), buf)
+            }
+        }
+
+        #[cfg(feature = "rawfd")]
+        impl WriteVolatile for &$raw_fd_ty {
+            fn write_volatile<B: BitmapSlice>(
+                &mut self,
+                buf: &VolatileSlice<B>,
+            ) -> Result<usize, VolatileMemoryError> {
+                write_volatile_raw_fd(self.as_fd(), buf)
+            }
+        }
+
+        #[cfg(feature = "rawfd")]
+        impl WriteVolatile for &mut $raw_fd_ty {
+            fn write_volatile<B: BitmapSlice>(
+                &mut self,
+                buf: &VolatileSlice<B>,
+            ) -> Result<usize, VolatileMemoryError> {
+                write_volatile_raw_fd(self.as_fd(), buf)
             }
         }
     };
 }
 
+#[cfg(feature = "rawfd")]
 impl WriteVolatile for Stdout {
     fn write_volatile<B: BitmapSlice>(
         &mut self,
         buf: &VolatileSlice<B>,
     ) -> Result<usize, VolatileMemoryError> {
-        write_volatile_raw_fd(self, buf)
+        write_volatile_raw_fd(self.as_fd(), buf)
+    }
+}
+
+#[cfg(feature = "rawfd")]
+impl WriteVolatile for &Stdout {
+    fn write_volatile<B: BitmapSlice>(
+        &mut self,
+        buf: &VolatileSlice<B>,
+    ) -> Result<usize, VolatileMemoryError> {
+        write_volatile_raw_fd(self.as_fd(), buf)
     }
 }
 
@@ -153,8 +223,9 @@ impl_read_write_volatile_for_raw_fd!(std::os::fd::BorrowedFd<'_>);
 /// the given [`VolatileSlice`].
 ///
 /// Returns the numbers of bytes read.
-fn read_volatile_raw_fd<Fd: AsRawFd>(
-    raw_fd: &mut Fd,
+#[cfg(feature = "rawfd")]
+fn read_volatile_raw_fd(
+    raw_fd: BorrowedFd<'_>,
     buf: &mut VolatileSlice<impl BitmapSlice>,
 ) -> Result<usize, VolatileMemoryError> {
     let fd = raw_fd.as_raw_fd();
@@ -162,9 +233,9 @@ fn read_volatile_raw_fd<Fd: AsRawFd>(
 
     let dst = guard.as_ptr().cast::<libc::c_void>();
 
-    // SAFETY: We got a valid file descriptor from `AsRawFd`. The memory pointed to by `dst` is
-    // valid for writes of length `buf.len() by the invariants upheld by the constructor
-    // of `VolatileSlice`.
+    // SAFETY: Rust's I/O safety invariants ensure that BorrowedFd contains a valid file descriptor`.
+    // The memory pointed to by `dst` is valid for writes of length `buf.len() by the invariants
+    // upheld by the constructor of `VolatileSlice`.
     let bytes_read = unsafe { libc::read(fd, dst, buf.len()) };
 
     if bytes_read < 0 {
@@ -183,8 +254,9 @@ fn read_volatile_raw_fd<Fd: AsRawFd>(
 /// data stored in the given [`VolatileSlice`].
 ///
 /// Returns the numbers of bytes written.
-fn write_volatile_raw_fd<Fd: AsRawFd>(
-    raw_fd: &mut Fd,
+#[cfg(feature = "rawfd")]
+fn write_volatile_raw_fd(
+    raw_fd: BorrowedFd<'_>,
     buf: &VolatileSlice<impl BitmapSlice>,
 ) -> Result<usize, VolatileMemoryError> {
     let fd = raw_fd.as_raw_fd();
@@ -192,9 +264,9 @@ fn write_volatile_raw_fd<Fd: AsRawFd>(
 
     let src = guard.as_ptr().cast::<libc::c_void>();
 
-    // SAFETY: We got a valid file descriptor from `AsRawFd`. The memory pointed to by `src` is
-    // valid for reads of length `buf.len() by the invariants upheld by the constructor
-    // of `VolatileSlice`.
+    // SAFETY: Rust's I/O safety invariants ensure that BorrowedFd contains a valid file descriptor`.
+    // The memory pointed to by `src` is valid for reads of length `buf.len() by the invariants
+    // upheld by the constructor of `VolatileSlice`.
     let bytes_written = unsafe { libc::write(fd, src, buf.len()) };
 
     if bytes_written < 0 {
@@ -210,16 +282,16 @@ impl WriteVolatile for &mut [u8] {
         buf: &VolatileSlice<B>,
     ) -> Result<usize, VolatileMemoryError> {
         let total = buf.len().min(self.len());
-        let src = buf.subslice(0, total)?;
 
         // SAFETY:
-        // We check above that `src` is contiguously allocated memory of length `total <= self.len())`.
-        // Furthermore, both src and dst of the call to
-        // copy_from_volatile_slice are valid for reads and writes respectively of length `total`
-        // since total is the minimum of lengths of the memory areas pointed to. The areas do not
-        // overlap, since `dst` is inside guest memory, and buf is a slice (no slices to guest
-        // memory are possible without violating rust's aliasing rules).
-        let written = unsafe { copy_from_volatile_slice(self.as_mut_ptr(), &src, total) };
+        // `buf` is contiguously allocated memory of length `total <= buf.len())` by the invariants
+        // of `VolatileSlice`.
+        // Furthermore, both source and destination of the call to copy_from_volatile_slice are valid
+        // for reads and writes respectively of length `total` since total is the minimum of lengths
+        // of the memory areas pointed to. The areas do not overlap, since the source is inside guest
+        // memory, and the destination is a pointer derived from a slice (no slices to guest memory
+        // are possible without violating rust's aliasing rules).
+        let written = unsafe { copy_from_volatile_slice(self.as_mut_ptr(), buf, total) };
 
         // Advance the slice, just like the stdlib: https://doc.rust-lang.org/src/std/io/impls.rs.html#335
         *self = std::mem::take(self).split_at_mut(written).1;
@@ -249,15 +321,16 @@ impl ReadVolatile for &[u8] {
         buf: &mut VolatileSlice<B>,
     ) -> Result<usize, VolatileMemoryError> {
         let total = buf.len().min(self.len());
-        let dst = buf.subslice(0, total)?;
 
         // SAFETY:
-        // We check above that `dst` is contiguously allocated memory of length `total <= self.len())`.
-        // Furthermore, both src and dst of the call to copy_to_volatile_slice are valid for reads
-        // and writes respectively of length `total` since total is the minimum of lengths of the
-        // memory areas pointed to. The areas do not overlap, since `dst` is inside guest memory,
-        // and buf is a slice (no slices to guest memory are possible without violating rust's aliasing rules).
-        let read = unsafe { copy_to_volatile_slice(&dst, self.as_ptr(), total) };
+        // `buf` is contiguously allocated memory of length `total <= buf.len())` by the invariants
+        // of `VolatileSlice`.
+        // Furthermore, both source and destination of the call to copy_to_volatile_slice are valid
+        // for reads and writes respectively of length `total` since total is the minimum of lengths
+        // of the memory areas pointed to. The areas do not overlap, since the destination is inside
+        // guest memory, and the source is a pointer derived from a slice (no slices to guest memory
+        // are possible without violating rust's aliasing rules).
+        let read = unsafe { copy_to_volatile_slice(buf, self.as_ptr(), total) };
 
         // Advance the slice, just like the stdlib: https://doc.rust-lang.org/src/std/io/impls.rs.html#232-310
         *self = self.split_at(read).1;
@@ -361,7 +434,10 @@ impl WriteVolatile for Cursor<&mut [u8]> {
 mod tests {
     use crate::io::{ReadVolatile, WriteVolatile};
     use crate::{VolatileMemoryError, VolatileSlice};
-    use std::io::{Cursor, ErrorKind, Read, Seek, Write};
+    use std::io::{Cursor, ErrorKind};
+    #[cfg(feature = "rawfd")]
+    use std::io::{Read, Seek, Write};
+    #[cfg(feature = "rawfd")]
     use vmm_sys_util::tempfile::TempFile;
 
     // ---- Test ReadVolatile for &[u8] ----
@@ -398,6 +474,7 @@ mod tests {
     }
 
     // ---- Test ReadVolatile for File ----
+    #[cfg(all(feature = "rawfd", not(miri)))]
     fn read_4_bytes_from_file(source: Vec<u8>, expected_output: [u8; 5]) {
         let mut temp_file = TempFile::new().unwrap().into_file();
         temp_file.write_all(source.as_ref()).unwrap();
@@ -441,6 +518,7 @@ mod tests {
 
         for (input, output) in test_cases {
             read_4_bytes_to_5_byte_memory(input.clone(), output);
+            #[cfg(all(feature = "rawfd", not(miri)))]
             read_4_bytes_from_file(input, output);
         }
     }
@@ -481,6 +559,7 @@ mod tests {
     }
 
     // ---- Test ẂriteVolatile for File works ----
+    #[cfg(all(feature = "rawfd", not(miri)))]
     fn write_5_bytes_to_file(mut source: Vec<u8>) {
         // Test write_volatile for File works
         let mut temp_file = TempFile::new().unwrap().into_file();
@@ -524,6 +603,7 @@ mod tests {
 
         for (input, output) in test_cases {
             write_4_bytes_to_5_byte_vec(input.clone(), output);
+            #[cfg(all(feature = "rawfd", not(miri)))]
             write_5_bytes_to_file(input);
         }
     }

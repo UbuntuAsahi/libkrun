@@ -102,26 +102,16 @@ from [Temporal's hybrid grammar].
 // support a span of time of about 52 hours or so.)
 
 use crate::{
-    error::{err, Error, ErrorContext},
+    error::{fmt::offset::Error as E, Error, ErrorContext},
     fmt::{
+        buffer::ArrayBuffer,
         temporal::{PiecesNumericOffset, PiecesOffset},
-        util::{parse_temporal_fraction, FractionalFormatter},
+        util::parse_temporal_fraction,
         Parsed,
     },
     tz::Offset,
-    util::{
-        escape, parse,
-        rangeint::{ri8, RFrom},
-        t::{self, C},
-    },
+    util::{b, parse},
 };
-
-// We define our own ranged types because we want them to only be positive. We
-// represent the sign explicitly as a separate field. But the range supported
-// is the same as the component fields of `Offset`.
-type ParsedOffsetHours = ri8<0, { t::SpanZoneOffsetHours::MAX }>;
-type ParsedOffsetMinutes = ri8<0, { t::SpanZoneOffsetMinutes::MAX }>;
-type ParsedOffsetSeconds = ri8<0, { t::SpanZoneOffsetSeconds::MAX }>;
 
 /// An offset that has been parsed from a datetime string.
 ///
@@ -165,7 +155,7 @@ impl ParsedOffset {
             ParsedOffsetKind::Zulu => Ok(PiecesOffset::Zulu),
             ParsedOffsetKind::Numeric(ref numeric) => {
                 let mut off = PiecesNumericOffset::from(numeric.to_offset()?);
-                if numeric.sign < C(0) {
+                if numeric.sign.is_negative() {
                     off = off.with_negative_zero();
                 }
                 Ok(PiecesOffset::from(off))
@@ -191,6 +181,17 @@ impl ParsedOffset {
     }
 }
 
+impl core::fmt::Display for ParsedOffset {
+    fn fmt(&self, f: &mut core::fmt::Formatter) -> core::fmt::Result {
+        match self.kind {
+            ParsedOffsetKind::Zulu => f.write_str("Z"),
+            ParsedOffsetKind::Numeric(ref numeric) => {
+                core::fmt::Display::fmt(numeric, f)
+            }
+        }
+    }
+}
+
 /// The kind of a parsed offset.
 #[derive(Debug)]
 enum ParsedOffsetKind {
@@ -205,18 +206,18 @@ enum ParsedOffsetKind {
 struct Numeric {
     /// The sign that was parsed from the numeric UTC offset. This is always
     /// either `1` or `-1`, never `0`.
-    sign: t::Sign,
+    sign: b::Sign,
     /// The hours component. This is non-optional because every UTC offset must
     /// have at least hours.
-    hours: ParsedOffsetHours,
+    hours: i8,
     /// The minutes component.
-    minutes: Option<ParsedOffsetMinutes>,
+    minutes: Option<i8>,
     /// The seconds component. This is only possible when subminute resolution
     /// is enabled.
-    seconds: Option<ParsedOffsetSeconds>,
+    seconds: Option<i8>,
     /// The nanoseconds fractional component. This is only possible when
     /// subminute resolution is enabled.
-    nanoseconds: Option<t::SubsecNanosecond>,
+    nanoseconds: Option<i32>,
 }
 
 impl Numeric {
@@ -226,27 +227,23 @@ impl Numeric {
     /// result, if the parsed value would be rounded to a value not in bounds
     /// for a Jiff offset, this returns an error.
     fn to_offset(&self) -> Result<Offset, Error> {
-        let mut seconds = t::SpanZoneOffset::rfrom(C(3_600) * self.hours);
+        let mut seconds = i32::from(self.hours) * b::SECS_PER_HOUR_32;
         if let Some(part_minutes) = self.minutes {
-            seconds += C(60) * part_minutes;
+            seconds += i32::from(part_minutes) * b::SECS_PER_MIN_32;
         }
         if let Some(part_seconds) = self.seconds {
-            seconds += part_seconds;
+            seconds += i32::from(part_seconds);
         }
         if let Some(part_nanoseconds) = self.nanoseconds {
-            if part_nanoseconds >= C(500_000_000) {
-                seconds = seconds
-                    .try_checked_add("offset-seconds", C(1))
-                    .with_context(|| {
-                        err!(
-                            "due to precision loss, UTC offset '{}' is \
-                             rounded to a value that is out of bounds",
-                            self,
-                        )
-                    })?;
+            if part_nanoseconds >= 500_000_000 {
+                seconds += 1;
             }
         }
-        Ok(Offset::from_seconds_ranged(seconds * self.sign))
+        // This can only fail if rounding because of a fractional second
+        // would lead to a number of seconds that is out of bounds. In which
+        // case, we report it as a precision loss.
+        Ok(Offset::from_seconds(self.sign * seconds)
+            .map_err(|_| E::PrecisionLoss)?)
     }
 }
 
@@ -254,23 +251,39 @@ impl Numeric {
 // `Offset` fails.
 impl core::fmt::Display for Numeric {
     fn fmt(&self, f: &mut core::fmt::Formatter) -> core::fmt::Result {
-        if self.sign == C(-1) {
-            write!(f, "-")?;
+        let mut buf = ArrayBuffer::<19>::default();
+        let mut bbuf = buf.as_borrowed();
+
+        bbuf.write_ascii_char(if self.sign.is_negative() {
+            b'-'
         } else {
-            write!(f, "+")?;
-        }
-        write!(f, "{:02}", self.hours)?;
+            b'+'
+        });
+        bbuf.write_int_pad2(self.hours.unsigned_abs());
         if let Some(minutes) = self.minutes {
-            write!(f, ":{:02}", minutes)?;
+            bbuf.write_ascii_char(b':');
+            bbuf.write_int_pad2(minutes.unsigned_abs());
         }
         if let Some(seconds) = self.seconds {
-            write!(f, ":{:02}", seconds)?;
+            if self.minutes.is_none() {
+                bbuf.write_str(":00");
+            }
+            bbuf.write_ascii_char(b':');
+            bbuf.write_int_pad2(seconds.unsigned_abs());
         }
         if let Some(nanos) = self.nanoseconds {
-            static FMT: FractionalFormatter = FractionalFormatter::new();
-            write!(f, ".{}", FMT.format(i64::from(nanos)).as_str())?;
+            if nanos != 0 {
+                if self.minutes.is_none() {
+                    bbuf.write_str(":00");
+                }
+                if self.seconds.is_none() {
+                    bbuf.write_str(":00");
+                }
+                bbuf.write_ascii_char(b'.');
+                bbuf.write_fraction(None, nanos.unsigned_abs());
+            }
         }
-        Ok(())
+        f.write_str(bbuf.filled())
     }
 }
 
@@ -409,18 +422,14 @@ impl Parser {
         mut input: &'i [u8],
     ) -> Result<Parsed<'i, ParsedOffset>, Error> {
         if input.is_empty() {
-            return Err(err!("expected UTC offset, but found end of input"));
+            return Err(Error::from(E::EndOfInput));
         }
 
         if input[0] == b'Z' || input[0] == b'z' {
             if !self.zulu {
-                return Err(err!(
-                    "found {z:?} in {original:?} where a numeric UTC offset \
-                     was expected (this context does not permit \
-                     the Zulu offset)",
-                    z = escape::Byte(input[0]),
-                    original = escape::Bytes(input),
-                ));
+                return Err(Error::from(E::UnexpectedLetterOffsetNoZulu(
+                    input[0],
+                )));
             }
             input = &input[1..];
             let value = ParsedOffset { kind: ParsedOffsetKind::Zulu };
@@ -460,40 +469,24 @@ impl Parser {
         &self,
         input: &'i [u8],
     ) -> Result<Parsed<'i, Numeric>, Error> {
-        let original = escape::Bytes(input);
-
         // Parse sign component.
         let Parsed { value: sign, input } =
-            self.parse_sign(input).with_context(|| {
-                err!("failed to parse sign in UTC numeric offset {original:?}")
-            })?;
+            self.parse_sign(input).context(E::InvalidSign)?;
 
         // Parse hours component.
         let Parsed { value: hours, input } =
-            self.parse_hours(input).with_context(|| {
-                err!(
-                    "failed to parse hours in UTC numeric offset {original:?}"
-                )
-            })?;
+            self.parse_hours(input).context(E::InvalidHours)?;
         let extended = match self.colon {
             Colon::Optional => input.starts_with(b":"),
             Colon::Required => {
                 if !input.is_empty() && !input.starts_with(b":") {
-                    return Err(err!(
-                        "parsed hour component of time zone offset from \
-                         {original:?}, but could not find required colon \
-                         separator",
-                    ));
+                    return Err(Error::from(E::NoColonAfterHours));
                 }
                 true
             }
             Colon::Absent => {
                 if !input.is_empty() && input.starts_with(b":") {
-                    return Err(err!(
-                        "parsed hour component of time zone offset from \
-                         {original:?}, but found colon after hours which \
-                         is not allowed",
-                    ));
+                    return Err(Error::from(E::ColonAfterHours));
                 }
                 false
             }
@@ -509,32 +502,22 @@ impl Parser {
         };
 
         // Parse optional separator after hours.
-        let Parsed { value: has_minutes, input } =
-            self.parse_separator(input, extended).with_context(|| {
-                err!(
-                    "failed to parse separator after hours in \
-                     UTC numeric offset {original:?}"
-                )
-            })?;
+        let Parsed { value: has_minutes, input } = self
+            .parse_separator(input, extended)
+            .context(E::SeparatorAfterHours)?;
         if !has_minutes {
-            if self.require_minute || (self.subminute && self.require_second) {
-                return Err(err!(
-                    "parsed hour component of time zone offset from \
-                     {original:?}, but could not find required minute \
-                     component",
-                ));
-            }
-            return Ok(Parsed { value: numeric, input });
+            return if self.require_minute
+                || (self.subminute && self.require_second)
+            {
+                Err(Error::from(E::MissingMinuteAfterHour))
+            } else {
+                Ok(Parsed { value: numeric, input })
+            };
         }
 
         // Parse minutes component.
         let Parsed { value: minutes, input } =
-            self.parse_minutes(input).with_context(|| {
-                err!(
-                    "failed to parse minutes in UTC numeric offset \
-                     {original:?}"
-                )
-            })?;
+            self.parse_minutes(input).context(E::InvalidMinutes)?;
         numeric.minutes = Some(minutes);
 
         // If subminute resolution is not supported, then we're done here.
@@ -545,66 +528,44 @@ impl Parser {
             // more precision than is supported. So we return an error here.
             // If this winds up being problematic, we can make this error
             // configurable or remove it altogether (unfortunate).
-            if input.get(0).map_or(false, |&b| b == b':') {
-                return Err(err!(
-                    "subminute precision for UTC numeric offset {original:?} \
-                     is not enabled in this context (must provide only \
-                     integral minutes)",
-                ));
-            }
-            return Ok(Parsed { value: numeric, input });
+            return if input.get(0).map_or(false, |&b| b == b':') {
+                Err(Error::from(E::SubminutePrecisionNotEnabled))
+            } else {
+                Ok(Parsed { value: numeric, input })
+            };
         }
 
         // Parse optional separator after minutes.
-        let Parsed { value: has_seconds, input } =
-            self.parse_separator(input, extended).with_context(|| {
-                err!(
-                    "failed to parse separator after minutes in \
-                     UTC numeric offset {original:?}"
-                )
-            })?;
+        let Parsed { value: has_seconds, input } = self
+            .parse_separator(input, extended)
+            .context(E::SeparatorAfterMinutes)?;
         if !has_seconds {
-            if self.require_second {
-                return Err(err!(
-                    "parsed hour and minute components of time zone offset \
-                     from {original:?}, but could not find required second \
-                     component",
-                ));
-            }
-            return Ok(Parsed { value: numeric, input });
+            return if self.require_second {
+                Err(Error::from(E::MissingSecondAfterMinute))
+            } else {
+                Ok(Parsed { value: numeric, input })
+            };
         }
 
         // Parse seconds component.
         let Parsed { value: seconds, input } =
-            self.parse_seconds(input).with_context(|| {
-                err!(
-                    "failed to parse seconds in UTC numeric offset \
-                     {original:?}"
-                )
-            })?;
+            self.parse_seconds(input).context(E::InvalidSeconds)?;
         numeric.seconds = Some(seconds);
 
         // If subsecond resolution is not supported, then we're done here.
         if !self.subsecond {
             if input.get(0).map_or(false, |&b| b == b'.' || b == b',') {
-                return Err(err!(
-                    "subsecond precision for UTC numeric offset {original:?} \
-                     is not enabled in this context (must provide only \
-                     integral minutes or seconds)",
-                ));
+                return Err(Error::from(E::SubsecondPrecisionNotEnabled));
             }
             return Ok(Parsed { value: numeric, input });
         }
 
         // Parse an optional fractional component.
         let Parsed { value: nanoseconds, input } =
-            parse_temporal_fraction(input).with_context(|| {
-                err!(
-                    "failed to parse fractional nanoseconds in \
-                     UTC numeric offset {original:?}",
-                )
-            })?;
-        numeric.nanoseconds = nanoseconds;
+            parse_temporal_fraction(input)
+                .context(E::InvalidSecondsFractional)?;
+        // OK because `parse_temporal_fraction` guarantees `0..=999_999_999`.
+        numeric.nanoseconds = nanoseconds.map(|n| i32::try_from(n).unwrap());
         Ok(Parsed { value: numeric, input })
     }
 
@@ -612,20 +573,14 @@ impl Parser {
     fn parse_sign<'i>(
         &self,
         input: &'i [u8],
-    ) -> Result<Parsed<'i, t::Sign>, Error> {
-        let sign = input.get(0).copied().ok_or_else(|| {
-            err!("expected UTC numeric offset, but found end of input")
-        })?;
+    ) -> Result<Parsed<'i, b::Sign>, Error> {
+        let sign = input.get(0).copied().ok_or(E::EndOfInputNumeric)?;
         let sign = if sign == b'+' {
-            t::Sign::N::<1>()
+            b::Sign::Positive
         } else if sign == b'-' {
-            t::Sign::N::<-1>()
+            b::Sign::Negative
         } else {
-            return Err(err!(
-                "expected '+' or '-' sign at start of UTC numeric offset, \
-                 but found {found:?} instead",
-                found = escape::Byte(sign),
-            ));
+            return Err(Error::from(E::InvalidSignPlusOrMinus));
         };
         Ok(Parsed { value: sign, input: &input[1..] })
     }
@@ -634,23 +589,10 @@ impl Parser {
     fn parse_hours<'i>(
         &self,
         input: &'i [u8],
-    ) -> Result<Parsed<'i, ParsedOffsetHours>, Error> {
-        let (hours, input) = parse::split(input, 2).ok_or_else(|| {
-            err!("expected two digit hour after sign, but found end of input",)
-        })?;
-        let hours = parse::i64(hours).with_context(|| {
-            err!(
-                "failed to parse {hours:?} as hours (a two digit integer)",
-                hours = escape::Bytes(hours),
-            )
-        })?;
-        // Note that we support a slightly bigger range of offsets than
-        // Temporal. Temporal seems to support only up to 23 hours, but
-        // we go up to 25 hours. This is done to support POSIX time zone
-        // strings, which also require 25 hours (plus the maximal minute/second
-        // components).
-        let hours = ParsedOffsetHours::try_new("hours", hours)
-            .context("offset hours are not valid")?;
+    ) -> Result<Parsed<'i, i8>, Error> {
+        let (hours, input) =
+            parse::split(input, 2).ok_or(E::EndOfInputHour)?;
+        let hours = b::OffsetHours::parse(hours).context(E::ParseHours)?;
         Ok(Parsed { value: hours, input })
     }
 
@@ -658,21 +600,11 @@ impl Parser {
     fn parse_minutes<'i>(
         &self,
         input: &'i [u8],
-    ) -> Result<Parsed<'i, ParsedOffsetMinutes>, Error> {
-        let (minutes, input) = parse::split(input, 2).ok_or_else(|| {
-            err!(
-                "expected two digit minute after hours, \
-                 but found end of input",
-            )
-        })?;
-        let minutes = parse::i64(minutes).with_context(|| {
-            err!(
-                "failed to parse {minutes:?} as minutes (a two digit integer)",
-                minutes = escape::Bytes(minutes),
-            )
-        })?;
-        let minutes = ParsedOffsetMinutes::try_new("minutes", minutes)
-            .context("minutes are not valid")?;
+    ) -> Result<Parsed<'i, i8>, Error> {
+        let (minutes, input) =
+            parse::split(input, 2).ok_or(E::EndOfInputMinute)?;
+        let minutes =
+            b::OffsetMinutes::parse(minutes).context(E::ParseMinutes)?;
         Ok(Parsed { value: minutes, input })
     }
 
@@ -680,21 +612,11 @@ impl Parser {
     fn parse_seconds<'i>(
         &self,
         input: &'i [u8],
-    ) -> Result<Parsed<'i, ParsedOffsetSeconds>, Error> {
-        let (seconds, input) = parse::split(input, 2).ok_or_else(|| {
-            err!(
-                "expected two digit second after hours, \
-                 but found end of input",
-            )
-        })?;
-        let seconds = parse::i64(seconds).with_context(|| {
-            err!(
-                "failed to parse {seconds:?} as seconds (a two digit integer)",
-                seconds = escape::Bytes(seconds),
-            )
-        })?;
-        let seconds = ParsedOffsetSeconds::try_new("seconds", seconds)
-            .context("time zone offset seconds are not valid")?;
+    ) -> Result<Parsed<'i, i8>, Error> {
+        let (seconds, input) =
+            parse::split(input, 2).ok_or(E::EndOfInputSecond)?;
+        let seconds =
+            b::OffsetSeconds::parse(seconds).context(E::ParseSeconds)?;
         Ok(Parsed { value: seconds, input })
     }
 
@@ -741,8 +663,6 @@ pub(crate) enum Colon {
 
 #[cfg(test)]
 mod tests {
-    use crate::util::rangeint::RInto;
-
     use super::*;
 
     #[test]
@@ -935,7 +855,7 @@ mod tests {
     fn err_numeric_empty() {
         insta::assert_snapshot!(
             Parser::new().parse_numeric(b"").unwrap_err(),
-            @r###"failed to parse sign in UTC numeric offset "": expected UTC numeric offset, but found end of input"###,
+            @"failed to parse sign in UTC numeric offset: expected UTC numeric offset, but found end of input",
         );
     }
 
@@ -944,7 +864,7 @@ mod tests {
     fn err_numeric_notsign() {
         insta::assert_snapshot!(
             Parser::new().parse_numeric(b"*").unwrap_err(),
-            @r###"failed to parse sign in UTC numeric offset "*": expected '+' or '-' sign at start of UTC numeric offset, but found "*" instead"###,
+            @"failed to parse sign in UTC numeric offset: expected `+` or `-` sign at start of UTC numeric offset",
         );
     }
 
@@ -953,7 +873,7 @@ mod tests {
     fn err_numeric_hours_too_short() {
         insta::assert_snapshot!(
             Parser::new().parse_numeric(b"+a").unwrap_err(),
-            @r###"failed to parse hours in UTC numeric offset "+a": expected two digit hour after sign, but found end of input"###,
+            @"failed to parse hours in UTC numeric offset: expected two digit hour after sign, but found end of input",
         );
     }
 
@@ -962,7 +882,7 @@ mod tests {
     fn err_numeric_hours_invalid_digits() {
         insta::assert_snapshot!(
             Parser::new().parse_numeric(b"+ab").unwrap_err(),
-            @r###"failed to parse hours in UTC numeric offset "+ab": failed to parse "ab" as hours (a two digit integer): invalid digit, expected 0-9 but got a"###,
+            @"failed to parse hours in UTC numeric offset: failed to parse hours (requires a two digit integer): invalid digit, expected 0-9 but got a",
         );
     }
 
@@ -971,7 +891,7 @@ mod tests {
     fn err_numeric_hours_out_of_range() {
         insta::assert_snapshot!(
             Parser::new().parse_numeric(b"-26").unwrap_err(),
-            @r###"failed to parse hours in UTC numeric offset "-26": offset hours are not valid: parameter 'hours' with value 26 is not in the required range of 0..=25"###,
+            @"failed to parse hours in UTC numeric offset: failed to parse hours (requires a two digit integer): parameter 'time zone offset hours' is not in the required range of -25..=25",
         );
     }
 
@@ -980,7 +900,7 @@ mod tests {
     fn err_numeric_minutes_too_short() {
         insta::assert_snapshot!(
             Parser::new().parse_numeric(b"+05:a").unwrap_err(),
-            @r###"failed to parse minutes in UTC numeric offset "+05:a": expected two digit minute after hours, but found end of input"###,
+            @"failed to parse minutes in UTC numeric offset: expected two digit minute after hours, but found end of input",
         );
     }
 
@@ -989,7 +909,7 @@ mod tests {
     fn err_numeric_minutes_invalid_digits() {
         insta::assert_snapshot!(
             Parser::new().parse_numeric(b"+05:ab").unwrap_err(),
-            @r###"failed to parse minutes in UTC numeric offset "+05:ab": failed to parse "ab" as minutes (a two digit integer): invalid digit, expected 0-9 but got a"###,
+            @"failed to parse minutes in UTC numeric offset: failed to parse minutes (requires a two digit integer): invalid digit, expected 0-9 but got a",
         );
     }
 
@@ -998,7 +918,7 @@ mod tests {
     fn err_numeric_minutes_out_of_range() {
         insta::assert_snapshot!(
             Parser::new().parse_numeric(b"-05:60").unwrap_err(),
-            @r###"failed to parse minutes in UTC numeric offset "-05:60": minutes are not valid: parameter 'minutes' with value 60 is not in the required range of 0..=59"###,
+            @"failed to parse minutes in UTC numeric offset: failed to parse minutes (requires a two digit integer): parameter 'time zone offset minutes' is not in the required range of -59..=59",
         );
     }
 
@@ -1007,7 +927,7 @@ mod tests {
     fn err_numeric_seconds_too_short() {
         insta::assert_snapshot!(
             Parser::new().parse_numeric(b"+05:30:a").unwrap_err(),
-            @r###"failed to parse seconds in UTC numeric offset "+05:30:a": expected two digit second after hours, but found end of input"###,
+            @"failed to parse seconds in UTC numeric offset: expected two digit second after minutes, but found end of input",
         );
     }
 
@@ -1016,7 +936,7 @@ mod tests {
     fn err_numeric_seconds_invalid_digits() {
         insta::assert_snapshot!(
             Parser::new().parse_numeric(b"+05:30:ab").unwrap_err(),
-            @r###"failed to parse seconds in UTC numeric offset "+05:30:ab": failed to parse "ab" as seconds (a two digit integer): invalid digit, expected 0-9 but got a"###,
+            @"failed to parse seconds in UTC numeric offset: failed to parse seconds (requires a two digit integer): invalid digit, expected 0-9 but got a",
         );
     }
 
@@ -1025,7 +945,7 @@ mod tests {
     fn err_numeric_seconds_out_of_range() {
         insta::assert_snapshot!(
             Parser::new().parse_numeric(b"-05:30:60").unwrap_err(),
-            @r###"failed to parse seconds in UTC numeric offset "-05:30:60": time zone offset seconds are not valid: parameter 'seconds' with value 60 is not in the required range of 0..=59"###,
+            @"failed to parse seconds in UTC numeric offset: failed to parse seconds (requires a two digit integer): parameter 'time zone offset seconds' is not in the required range of -59..=59",
         );
     }
 
@@ -1035,31 +955,31 @@ mod tests {
     fn err_numeric_fraction_non_empty() {
         insta::assert_snapshot!(
             Parser::new().parse_numeric(b"-05:30:44.").unwrap_err(),
-            @r###"failed to parse fractional nanoseconds in UTC numeric offset "-05:30:44.": found decimal after seconds component, but did not find any decimal digits after decimal"###,
+            @"failed to parse fractional seconds in UTC numeric offset: found decimal after seconds component, but did not find any digits after decimal",
         );
         insta::assert_snapshot!(
             Parser::new().parse_numeric(b"-05:30:44,").unwrap_err(),
-            @r###"failed to parse fractional nanoseconds in UTC numeric offset "-05:30:44,": found decimal after seconds component, but did not find any decimal digits after decimal"###,
+            @"failed to parse fractional seconds in UTC numeric offset: found decimal after seconds component, but did not find any digits after decimal",
         );
 
         // Instead of end-of-string, add invalid digit.
         insta::assert_snapshot!(
             Parser::new().parse_numeric(b"-05:30:44.a").unwrap_err(),
-            @r###"failed to parse fractional nanoseconds in UTC numeric offset "-05:30:44.a": found decimal after seconds component, but did not find any decimal digits after decimal"###,
+            @"failed to parse fractional seconds in UTC numeric offset: found decimal after seconds component, but did not find any digits after decimal",
         );
         insta::assert_snapshot!(
             Parser::new().parse_numeric(b"-05:30:44,a").unwrap_err(),
-            @r###"failed to parse fractional nanoseconds in UTC numeric offset "-05:30:44,a": found decimal after seconds component, but did not find any decimal digits after decimal"###,
+            @"failed to parse fractional seconds in UTC numeric offset: found decimal after seconds component, but did not find any digits after decimal",
         );
 
         // And also test basic format.
         insta::assert_snapshot!(
             Parser::new().parse_numeric(b"-053044.a").unwrap_err(),
-            @r###"failed to parse fractional nanoseconds in UTC numeric offset "-053044.a": found decimal after seconds component, but did not find any decimal digits after decimal"###,
+            @"failed to parse fractional seconds in UTC numeric offset: found decimal after seconds component, but did not find any digits after decimal",
         );
         insta::assert_snapshot!(
             Parser::new().parse_numeric(b"-053044,a").unwrap_err(),
-            @r###"failed to parse fractional nanoseconds in UTC numeric offset "-053044,a": found decimal after seconds component, but did not find any decimal digits after decimal"###,
+            @"failed to parse fractional seconds in UTC numeric offset: found decimal after seconds component, but did not find any digits after decimal",
         );
     }
 
@@ -1070,7 +990,7 @@ mod tests {
     fn err_numeric_subminute_disabled_but_desired() {
         insta::assert_snapshot!(
             Parser::new().subminute(false).parse_numeric(b"-05:59:32").unwrap_err(),
-            @r###"subminute precision for UTC numeric offset "-05:59:32" is not enabled in this context (must provide only integral minutes)"###,
+            @"subminute precision for UTC numeric offset is not enabled in this context (must provide only integral minutes)",
         );
     }
 
@@ -1080,11 +1000,11 @@ mod tests {
     fn err_zulu_disabled_but_desired() {
         insta::assert_snapshot!(
             Parser::new().zulu(false).parse(b"Z").unwrap_err(),
-            @r###"found "Z" in "Z" where a numeric UTC offset was expected (this context does not permit the Zulu offset)"###,
+            @"found `Z` where a numeric UTC offset was expected (this context does not permit the Zulu offset)",
         );
         insta::assert_snapshot!(
             Parser::new().zulu(false).parse(b"z").unwrap_err(),
-            @r###"found "z" in "z" where a numeric UTC offset was expected (this context does not permit the Zulu offset)"###,
+            @"found `z` where a numeric UTC offset was expected (this context does not permit the Zulu offset)",
         );
     }
 
@@ -1095,24 +1015,24 @@ mod tests {
     #[test]
     fn err_numeric_too_big_for_offset() {
         let numeric = Numeric {
-            sign: t::Sign::MAX_SELF,
-            hours: ParsedOffsetHours::MAX_SELF,
-            minutes: Some(ParsedOffsetMinutes::MAX_SELF),
-            seconds: Some(ParsedOffsetSeconds::MAX_SELF),
-            nanoseconds: Some(C(499_999_999).rinto()),
+            sign: b::Sign::Positive,
+            hours: b::OffsetHours::MAX,
+            minutes: Some(b::OffsetMinutes::MAX),
+            seconds: Some(b::OffsetSeconds::MAX),
+            nanoseconds: Some(499_999_999),
         };
         assert_eq!(numeric.to_offset().unwrap(), Offset::MAX);
 
         let numeric = Numeric {
-            sign: t::Sign::MAX_SELF,
-            hours: ParsedOffsetHours::MAX_SELF,
-            minutes: Some(ParsedOffsetMinutes::MAX_SELF),
-            seconds: Some(ParsedOffsetSeconds::MAX_SELF),
-            nanoseconds: Some(C(500_000_000).rinto()),
+            sign: b::Sign::Positive,
+            hours: b::OffsetHours::MAX,
+            minutes: Some(b::OffsetMinutes::MAX),
+            seconds: Some(b::OffsetSeconds::MAX),
+            nanoseconds: Some(500_000_000),
         };
         insta::assert_snapshot!(
             numeric.to_offset().unwrap_err(),
-            @"due to precision loss, UTC offset '+25:59:59.5' is rounded to a value that is out of bounds: parameter 'offset-seconds' with value 1 is not in the required range of -93599..=93599",
+            @"due to precision loss from fractional seconds, time zone offset is rounded to a value that is out of bounds",
         );
     }
 
@@ -1120,24 +1040,24 @@ mod tests {
     #[test]
     fn err_numeric_too_small_for_offset() {
         let numeric = Numeric {
-            sign: t::Sign::MIN_SELF,
-            hours: ParsedOffsetHours::MAX_SELF,
-            minutes: Some(ParsedOffsetMinutes::MAX_SELF),
-            seconds: Some(ParsedOffsetSeconds::MAX_SELF),
-            nanoseconds: Some(C(499_999_999).rinto()),
+            sign: b::Sign::Negative,
+            hours: b::OffsetHours::MAX,
+            minutes: Some(b::OffsetMinutes::MAX),
+            seconds: Some(b::OffsetSeconds::MAX),
+            nanoseconds: Some(499_999_999),
         };
         assert_eq!(numeric.to_offset().unwrap(), Offset::MIN);
 
         let numeric = Numeric {
-            sign: t::Sign::MIN_SELF,
-            hours: ParsedOffsetHours::MAX_SELF,
-            minutes: Some(ParsedOffsetMinutes::MAX_SELF),
-            seconds: Some(ParsedOffsetSeconds::MAX_SELF),
-            nanoseconds: Some(C(500_000_000).rinto()),
+            sign: b::Sign::Negative,
+            hours: b::OffsetHours::MAX,
+            minutes: Some(b::OffsetMinutes::MAX),
+            seconds: Some(b::OffsetSeconds::MAX),
+            nanoseconds: Some(500_000_000),
         };
         insta::assert_snapshot!(
             numeric.to_offset().unwrap_err(),
-            @"due to precision loss, UTC offset '-25:59:59.5' is rounded to a value that is out of bounds: parameter 'offset-seconds' with value 1 is not in the required range of -93599..=93599",
+            @"due to precision loss from fractional seconds, time zone offset is rounded to a value that is out of bounds",
         );
     }
 }

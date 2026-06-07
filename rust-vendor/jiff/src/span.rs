@@ -3,16 +3,10 @@ use core::{cmp::Ordering, time::Duration as UnsignedDuration};
 use crate::{
     civil::{Date, DateTime, Time},
     duration::{Duration, SDuration},
-    error::{err, Error, ErrorContext},
+    error::{span::Error as E, unit::UnitConfigError, Error, ErrorContext},
     fmt::{friendly, temporal},
     tz::TimeZone,
-    util::{
-        borrow::DumbCow,
-        escape,
-        rangeint::{ri64, ri8, RFrom, RInto, TryRFrom, TryRInto},
-        round::increment,
-        t::{self, Constant, NoUnits, NoUnits128, Sign, C},
-    },
+    util::{b, borrow::DumbCow, round::Increment},
     RoundMode, SignedDuration, Timestamp, Zoned,
 };
 
@@ -557,12 +551,13 @@ pub(crate) use span_eq;
 ///     span.total(Unit::Hour).unwrap_err().to_string(),
 ///     "using unit 'day' in a span or configuration requires that either \
 ///      a relative reference time be given or \
-///      `SpanRelativeTo::days_are_24_hours()` is used to indicate \
+///      `jiff::SpanRelativeTo::days_are_24_hours()` is used to indicate \
 ///      invariant 24-hour days, but neither were provided",
 /// );
 /// // Opt into invariant 24 hour days without a relative date:
 /// let marker = SpanRelativeTo::days_are_24_hours();
 /// let hours = span.total((Unit::Hour, marker))?;
+/// assert_eq!(hours, 24.0);
 /// // Or use a relative civil date, and all days are 24 hours:
 /// let date = civil::date(2020, 1, 1);
 /// let hours = span.total((Unit::Hour, date))?;
@@ -662,10 +657,11 @@ pub(crate) use span_eq;
 /// assert_eq!(
 ///     Duration::try_from(span).unwrap_err().to_string(),
 ///     "failed to convert span to duration without relative datetime \
-///      (must use `Span::to_duration` instead): using unit 'day' in a \
-///      span or configuration requires that either a relative reference \
-///      time be given or `SpanRelativeTo::days_are_24_hours()` is used \
-///      to indicate invariant 24-hour days, but neither were provided",
+///      (must use `jiff::Span::to_duration` instead): using unit 'day' \
+///      in a span or configuration requires that either a relative \
+///      reference time be given or \
+///      `jiff::SpanRelativeTo::days_are_24_hours()` is used to indicate \
+///      invariant 24-hour days, but neither were provided",
 /// );
 ///
 /// # Ok::<(), Box<dyn std::error::Error>>(())
@@ -706,20 +702,20 @@ pub(crate) use span_eq;
 ///
 /// # Ok::<(), Box<dyn std::error::Error>>(())
 /// ```
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, Default)]
 pub struct Span {
-    sign: Sign,
+    sign: b::Sign,
     units: UnitSet,
-    years: t::SpanYears,
-    months: t::SpanMonths,
-    weeks: t::SpanWeeks,
-    days: t::SpanDays,
-    hours: t::SpanHours,
-    minutes: t::SpanMinutes,
-    seconds: t::SpanSeconds,
-    milliseconds: t::SpanMilliseconds,
-    microseconds: t::SpanMicroseconds,
-    nanoseconds: t::SpanNanoseconds,
+    years: i16,
+    months: i32,
+    weeks: i32,
+    days: i32,
+    hours: i32,
+    minutes: i64,
+    seconds: i64,
+    milliseconds: i64,
+    microseconds: i64,
+    nanoseconds: i64,
 }
 
 /// Infallible routines for setting units on a `Span`.
@@ -901,8 +897,10 @@ impl Span {
     /// The maximum value is `19,998`.
     #[inline]
     pub fn try_years<I: Into<i64>>(self, years: I) -> Result<Span, Error> {
-        let years = t::SpanYears::try_new("years", years)?;
-        Ok(self.years_ranged(years))
+        let years = b::SpanYears::check(years.into())?;
+        let mut span = self.years_unchecked(years.abs());
+        span.sign = self.resign(years, &span);
+        Ok(span)
     }
 
     /// Set the number of months on this span. The value may be negative.
@@ -916,9 +914,10 @@ impl Span {
     /// The maximum value is `239,976`.
     #[inline]
     pub fn try_months<I: Into<i64>>(self, months: I) -> Result<Span, Error> {
-        type Range = ri64<{ t::SpanMonths::MIN }, { t::SpanMonths::MAX }>;
-        let months = Range::try_new("months", months)?;
-        Ok(self.months_ranged(months.rinto()))
+        let months = b::SpanMonths::check(months.into())?;
+        let mut span = self.months_unchecked(months.abs());
+        span.sign = self.resign(months, &span);
+        Ok(span)
     }
 
     /// Set the number of weeks on this span. The value may be negative.
@@ -932,9 +931,10 @@ impl Span {
     /// The maximum value is `1_043_497`.
     #[inline]
     pub fn try_weeks<I: Into<i64>>(self, weeks: I) -> Result<Span, Error> {
-        type Range = ri64<{ t::SpanWeeks::MIN }, { t::SpanWeeks::MAX }>;
-        let weeks = Range::try_new("weeks", weeks)?;
-        Ok(self.weeks_ranged(weeks.rinto()))
+        let weeks = b::SpanWeeks::check(weeks.into())?;
+        let mut span = self.weeks_unchecked(weeks.abs());
+        span.sign = self.resign(weeks, &span);
+        Ok(span)
     }
 
     /// Set the number of days on this span. The value may be negative.
@@ -948,9 +948,10 @@ impl Span {
     /// The maximum value is `7,304,484`.
     #[inline]
     pub fn try_days<I: Into<i64>>(self, days: I) -> Result<Span, Error> {
-        type Range = ri64<{ t::SpanDays::MIN }, { t::SpanDays::MAX }>;
-        let days = Range::try_new("days", days)?;
-        Ok(self.days_ranged(days.rinto()))
+        let days = b::SpanDays::check(days.into())?;
+        let mut span = self.days_unchecked(days.abs());
+        span.sign = self.resign(days, &span);
+        Ok(span)
     }
 
     /// Set the number of hours on this span. The value may be negative.
@@ -964,9 +965,10 @@ impl Span {
     /// The maximum value is `175,307,616`.
     #[inline]
     pub fn try_hours<I: Into<i64>>(self, hours: I) -> Result<Span, Error> {
-        type Range = ri64<{ t::SpanHours::MIN }, { t::SpanHours::MAX }>;
-        let hours = Range::try_new("hours", hours)?;
-        Ok(self.hours_ranged(hours.rinto()))
+        let hours = b::SpanHours::check(hours.into())?;
+        let mut span = self.hours_unchecked(hours.abs());
+        span.sign = self.resign(hours, &span);
+        Ok(span)
     }
 
     /// Set the number of minutes on this span. The value may be negative.
@@ -980,9 +982,10 @@ impl Span {
     /// The maximum value is `10,518,456,960`.
     #[inline]
     pub fn try_minutes<I: Into<i64>>(self, minutes: I) -> Result<Span, Error> {
-        type Range = ri64<{ t::SpanMinutes::MIN }, { t::SpanMinutes::MAX }>;
-        let minutes = Range::try_new("minutes", minutes.into())?;
-        Ok(self.minutes_ranged(minutes))
+        let minutes = b::SpanMinutes::check(minutes.into())?;
+        let mut span = self.minutes_unchecked(minutes.abs());
+        span.sign = self.resign(minutes, &span);
+        Ok(span)
     }
 
     /// Set the number of seconds on this span. The value may be negative.
@@ -996,9 +999,10 @@ impl Span {
     /// The maximum value is `631,107,417,600`.
     #[inline]
     pub fn try_seconds<I: Into<i64>>(self, seconds: I) -> Result<Span, Error> {
-        type Range = ri64<{ t::SpanSeconds::MIN }, { t::SpanSeconds::MAX }>;
-        let seconds = Range::try_new("seconds", seconds.into())?;
-        Ok(self.seconds_ranged(seconds))
+        let seconds = b::SpanSeconds::check(seconds.into())?;
+        let mut span = self.seconds_unchecked(seconds.abs());
+        span.sign = self.resign(seconds, &span);
+        Ok(span)
     }
 
     /// Set the number of milliseconds on this span. The value may be negative.
@@ -1016,11 +1020,10 @@ impl Span {
         self,
         milliseconds: I,
     ) -> Result<Span, Error> {
-        type Range =
-            ri64<{ t::SpanMilliseconds::MIN }, { t::SpanMilliseconds::MAX }>;
-        let milliseconds =
-            Range::try_new("milliseconds", milliseconds.into())?;
-        Ok(self.milliseconds_ranged(milliseconds))
+        let milliseconds = b::SpanMilliseconds::check(milliseconds.into())?;
+        let mut span = self.milliseconds_unchecked(milliseconds.abs());
+        span.sign = self.resign(milliseconds, &span);
+        Ok(span)
     }
 
     /// Set the number of microseconds on this span. The value may be negative.
@@ -1038,11 +1041,10 @@ impl Span {
         self,
         microseconds: I,
     ) -> Result<Span, Error> {
-        type Range =
-            ri64<{ t::SpanMicroseconds::MIN }, { t::SpanMicroseconds::MAX }>;
-        let microseconds =
-            Range::try_new("microseconds", microseconds.into())?;
-        Ok(self.microseconds_ranged(microseconds))
+        let microseconds = b::SpanMicroseconds::check(microseconds.into())?;
+        let mut span = self.microseconds_unchecked(microseconds.abs());
+        span.sign = self.resign(microseconds, &span);
+        Ok(span)
     }
 
     /// Set the number of nanoseconds on this span. The value may be negative.
@@ -1067,10 +1069,10 @@ impl Span {
         self,
         nanoseconds: I,
     ) -> Result<Span, Error> {
-        type Range =
-            ri64<{ t::SpanNanoseconds::MIN }, { t::SpanNanoseconds::MAX }>;
-        let nanoseconds = Range::try_new("nanoseconds", nanoseconds.into())?;
-        Ok(self.nanoseconds_ranged(nanoseconds))
+        let nanoseconds = b::SpanNanoseconds::check(nanoseconds.into())?;
+        let mut span = self.nanoseconds_unchecked(nanoseconds.abs());
+        span.sign = self.resign(nanoseconds, &span);
+        Ok(span)
     }
 }
 
@@ -1095,7 +1097,7 @@ impl Span {
     /// ```
     #[inline]
     pub fn get_years(&self) -> i16 {
-        self.get_years_ranged().get()
+        self.sign * self.years
     }
 
     /// Returns the number of month units in this span.
@@ -1117,7 +1119,7 @@ impl Span {
     /// ```
     #[inline]
     pub fn get_months(&self) -> i32 {
-        self.get_months_ranged().get()
+        self.sign * self.months
     }
 
     /// Returns the number of week units in this span.
@@ -1139,7 +1141,7 @@ impl Span {
     /// ```
     #[inline]
     pub fn get_weeks(&self) -> i32 {
-        self.get_weeks_ranged().get()
+        self.sign * self.weeks
     }
 
     /// Returns the number of day units in this span.
@@ -1163,7 +1165,7 @@ impl Span {
     /// ```
     #[inline]
     pub fn get_days(&self) -> i32 {
-        self.get_days_ranged().get()
+        self.sign * self.days
     }
 
     /// Returns the number of hour units in this span.
@@ -1185,7 +1187,7 @@ impl Span {
     /// ```
     #[inline]
     pub fn get_hours(&self) -> i32 {
-        self.get_hours_ranged().get()
+        self.sign * self.hours
     }
 
     /// Returns the number of minute units in this span.
@@ -1207,7 +1209,7 @@ impl Span {
     /// ```
     #[inline]
     pub fn get_minutes(&self) -> i64 {
-        self.get_minutes_ranged().get()
+        self.sign * self.minutes
     }
 
     /// Returns the number of second units in this span.
@@ -1229,7 +1231,7 @@ impl Span {
     /// ```
     #[inline]
     pub fn get_seconds(&self) -> i64 {
-        self.get_seconds_ranged().get()
+        self.sign * self.seconds
     }
 
     /// Returns the number of millisecond units in this span.
@@ -1251,7 +1253,7 @@ impl Span {
     /// ```
     #[inline]
     pub fn get_milliseconds(&self) -> i64 {
-        self.get_milliseconds_ranged().get()
+        self.sign * self.milliseconds
     }
 
     /// Returns the number of microsecond units in this span.
@@ -1267,13 +1269,14 @@ impl Span {
     ///
     /// let span = 3.microseconds().nanoseconds(2_000);
     /// assert_eq!(3, span.get_microseconds());
+    /// // Floating point precision may provide imprecise results.
     /// assert_eq!(5.0, span.total(Unit::Microsecond)?);
     ///
     /// # Ok::<(), Box<dyn std::error::Error>>(())
     /// ```
     #[inline]
     pub fn get_microseconds(&self) -> i64 {
-        self.get_microseconds_ranged().get()
+        self.sign * self.microseconds
     }
 
     /// Returns the number of nanosecond units in this span.
@@ -1295,7 +1298,7 @@ impl Span {
     /// ```
     #[inline]
     pub fn get_nanoseconds(&self) -> i64 {
-        self.get_nanoseconds_ranged().get()
+        self.sign * self.nanoseconds
     }
 }
 
@@ -1320,7 +1323,7 @@ impl Span {
         if self.is_zero() {
             return self;
         }
-        Span { sign: ri8::N::<1>(), ..self }
+        Span { sign: b::Sign::Positive, ..self }
     }
 
     /// Returns a new span that negates this span.
@@ -1363,7 +1366,7 @@ impl Span {
     /// `0` when this span is zero and `1` when this span is positive.
     #[inline]
     pub fn signum(self) -> i8 {
-        self.sign.signum().get()
+        self.sign.signum()
     }
 
     /// Returns true if and only if this span is positive.
@@ -1380,7 +1383,7 @@ impl Span {
     /// ```
     #[inline]
     pub fn is_positive(self) -> bool {
-        self.get_sign_ranged() > C(0)
+        self.get_sign().is_positive()
     }
 
     /// Returns true if and only if this span is negative.
@@ -1397,7 +1400,7 @@ impl Span {
     /// ```
     #[inline]
     pub fn is_negative(self) -> bool {
-        self.get_sign_ranged() < C(0)
+        self.get_sign().is_negative()
     }
 
     /// Returns true if and only if every field in this span is set to `0`.
@@ -1415,7 +1418,7 @@ impl Span {
     /// ```
     #[inline]
     pub fn is_zero(self) -> bool {
-        self.sign == C(0)
+        self.sign.is_zero()
     }
 
     /// Returns this `Span` as a value with a type that implements the
@@ -1497,8 +1500,10 @@ impl Span {
         } else if rhs == 1 {
             return Ok(self);
         }
-        self.sign *= t::Sign::try_new("span factor", rhs.signum())
-            .expect("signum fits in ri8");
+        self.sign = self.sign * b::Sign::from(rhs);
+        // This can only fail when `rhs == i64::MIN`, which is out of bounds
+        // for all possible span units (including nanoseconds).
+        let rhs = rhs.checked_abs().ok_or_else(b::SpanMultiple::error)?;
         // This is all somewhat odd, but since each of our span fields uses
         // a different primitive representation and range of allowed values,
         // we only seek to perform multiplications when they will actually
@@ -1508,55 +1513,43 @@ impl Span {
         // actually going to multiply with it. If our span has non-zero years,
         // then our multiple can't exceed the bounds of `SpanYears`, otherwise
         // it is guaranteed to overflow.
-        if self.years != C(0) {
-            let rhs = t::SpanYears::try_new("years multiple", rhs)?;
-            self.years = self.years.try_checked_mul("years", rhs.abs())?;
+        if self.years != 0 {
+            let rhs = b::SpanYears::check(rhs)?;
+            self.years = b::SpanYears::checked_mul(self.years, rhs)?;
         }
-        if self.months != C(0) {
-            let rhs = t::SpanMonths::try_new("months multiple", rhs)?;
-            self.months = self.months.try_checked_mul("months", rhs.abs())?;
+        if self.months != 0 {
+            let rhs = b::SpanMonths::check(rhs)?;
+            self.months = b::SpanMonths::checked_mul(self.months, rhs)?;
         }
-        if self.weeks != C(0) {
-            let rhs = t::SpanWeeks::try_new("weeks multiple", rhs)?;
-            self.weeks = self.weeks.try_checked_mul("weeks", rhs.abs())?;
+        if self.weeks != 0 {
+            let rhs = b::SpanWeeks::check(rhs)?;
+            self.weeks = b::SpanWeeks::checked_mul(self.weeks, rhs)?;
         }
-        if self.days != C(0) {
-            let rhs = t::SpanDays::try_new("days multiple", rhs)?;
-            self.days = self.days.try_checked_mul("days", rhs.abs())?;
+        if self.days != 0 {
+            let rhs = b::SpanDays::check(rhs)?;
+            self.days = b::SpanDays::checked_mul(self.days, rhs)?;
         }
-        if self.hours != C(0) {
-            let rhs = t::SpanHours::try_new("hours multiple", rhs)?;
-            self.hours = self.hours.try_checked_mul("hours", rhs.abs())?;
+        if self.hours != 0 {
+            let rhs = b::SpanHours::check(rhs)?;
+            self.hours = b::SpanHours::checked_mul(self.hours, rhs)?;
         }
-        if self.minutes != C(0) {
-            let rhs = t::SpanMinutes::try_new("minutes multiple", rhs)?;
-            self.minutes =
-                self.minutes.try_checked_mul("minutes", rhs.abs())?;
+        if self.minutes != 0 {
+            self.minutes = b::SpanMinutes::checked_mul(self.minutes, rhs)?;
         }
-        if self.seconds != C(0) {
-            let rhs = t::SpanSeconds::try_new("seconds multiple", rhs)?;
-            self.seconds =
-                self.seconds.try_checked_mul("seconds", rhs.abs())?;
+        if self.seconds != 0 {
+            self.seconds = b::SpanSeconds::checked_mul(self.seconds, rhs)?;
         }
-        if self.milliseconds != C(0) {
-            let rhs =
-                t::SpanMilliseconds::try_new("milliseconds multiple", rhs)?;
-            self.milliseconds = self
-                .milliseconds
-                .try_checked_mul("milliseconds", rhs.abs())?;
+        if self.milliseconds != 0 {
+            self.milliseconds =
+                b::SpanMilliseconds::checked_mul(self.milliseconds, rhs)?;
         }
-        if self.microseconds != C(0) {
-            let rhs =
-                t::SpanMicroseconds::try_new("microseconds multiple", rhs)?;
-            self.microseconds = self
-                .microseconds
-                .try_checked_mul("microseconds", rhs.abs())?;
+        if self.microseconds != 0 {
+            self.microseconds =
+                b::SpanMicroseconds::checked_mul(self.microseconds, rhs)?;
         }
-        if self.nanoseconds != C(0) {
-            let rhs =
-                t::SpanNanoseconds::try_new("nanoseconds multiple", rhs)?;
+        if self.nanoseconds != 0 {
             self.nanoseconds =
-                self.nanoseconds.try_checked_mul("nanoseconds", rhs.abs())?;
+                b::SpanNanoseconds::checked_mul(self.nanoseconds, rhs)?;
         }
         // N.B. We don't need to update `self.units` here since it shouldn't
         // change. The only way it could is if a unit goes from zero to
@@ -1825,10 +1818,7 @@ impl Span {
         span: &Span,
     ) -> Result<Span, Error> {
         assert!(unit <= Unit::Week);
-        let nanos1 = self.to_invariant_nanoseconds();
-        let nanos2 = span.to_invariant_nanoseconds();
-        let sum = nanos1 + nanos2;
-        Span::from_invariant_nanoseconds(unit, sum)
+        self.checked_add_invariant_duration(unit, span.to_invariant_duration())
     }
 
     /// Like `checked_add_invariant`, but adds an absolute duration.
@@ -1836,13 +1826,14 @@ impl Span {
     fn checked_add_invariant_duration(
         &self,
         unit: Unit,
-        duration: SignedDuration,
+        rhs_duration: SignedDuration,
     ) -> Result<Span, Error> {
         assert!(unit <= Unit::Week);
-        let nanos1 = self.to_invariant_nanoseconds();
-        let nanos2 = t::NoUnits96::new_unchecked(duration.as_nanos());
-        let sum = nanos1 + nanos2;
-        Span::from_invariant_nanoseconds(unit, sum)
+        let self_duration = self.to_invariant_duration();
+        // OK because maximal invariant `Span` is way below maximal
+        // `SignedDuration`. Doubling it can never overflow.
+        let sum = self_duration + rhs_duration;
+        Span::from_invariant_duration(unit, sum)
     }
 
     /// This routine is identical to [`Span::checked_add`] with the given
@@ -2325,7 +2316,8 @@ impl Span {
     /// Converts a `Span` to a [`SignedDuration`] relative to the date given.
     ///
     /// In most cases, it is unlikely that you'll need to use this routine to
-    /// convert a `Span` to a `SignedDuration`. Namely, by default:
+    /// convert a `Span` to a `SignedDuration` and instead will be ably to
+    /// use `SignedDuration::try_from(span)`. Namely, by default:
     ///
     /// * [`Zoned::until`] guarantees that the biggest non-zero unit is hours.
     /// * [`Timestamp::until`] guarantees that the biggest non-zero unit is
@@ -2336,12 +2328,14 @@ impl Span {
     /// * [`Time::until`] guarantees that the biggest non-zero unit is hours.
     ///
     /// In the above, only [`DateTime::until`] and [`Date::until`] return
-    /// calendar units by default. In which case, one may pass
-    /// [`SpanRelativeTo::days_are_24_hours`] or an actual relative date to
-    /// resolve the length of a day.
+    /// calendar units by default, and thus would require this routine. (In
+    /// which case, one may pass [`SpanRelativeTo::days_are_24_hours`] or an
+    /// actual relative date to resolve the length of a day.)
     ///
-    /// Of course, any of the above can be changed by asking, for example,
-    /// `Zoned::until` to return units up to years.
+    /// Of course, one may change the defaults. For example, if one
+    /// uses `Zoned::until` with the largest unit set to `Unit::Year`
+    /// and the resulting `Span` includes non-zero calendar units, then
+    /// `SignedDuration::try_from` will fail because there is no relative date.
     ///
     /// # Errors
     ///
@@ -2393,341 +2387,280 @@ impl Span {
         let max_unit = self.largest_unit();
         let relative: SpanRelativeTo<'a> = relative.into();
         let Some(result) = relative.to_relative(max_unit).transpose() else {
-            return Ok(self.to_duration_invariant());
+            return Ok(self.to_invariant_duration());
         };
         let relspan = result
             .and_then(|r| r.into_relative_span(Unit::Second, *self))
             .with_context(|| match relative.kind {
-                SpanRelativeToKind::Civil(dt) => {
-                    err!(
-                        "could not compute normalized relative span \
-                         from datetime {dt} and span {self}",
-                    )
-                }
-                SpanRelativeToKind::Zoned(ref zdt) => {
-                    err!(
-                        "could not compute normalized relative span \
-                         from datetime {zdt} and span {self}",
-                    )
-                }
+                SpanRelativeToKind::Civil(_) => E::ToDurationCivil,
+                SpanRelativeToKind::Zoned(_) => E::ToDurationZoned,
                 SpanRelativeToKind::DaysAre24Hours => {
-                    err!(
-                        "could not compute normalized relative span \
-                         from {self} when all days are assumed to be \
-                         24 hours",
-                    )
+                    E::ToDurationDaysAre24Hours
                 }
             })?;
         debug_assert!(relspan.span.largest_unit() <= Unit::Second);
-        Ok(relspan.span.to_duration_invariant())
+        Ok(relspan.span.to_invariant_duration())
     }
 
-    /// Converts an entirely invariant span to a `SignedDuration`.
+    /// Converts the non-variable units of this `Span` to a `SignedDuration`.
     ///
-    /// Callers must ensure that this span has no units greater than weeks.
-    /// If it does have non-zero units of days or weeks, then every day is
-    /// considered 24 hours and every week 7 days. Generally speaking, callers
-    /// should also ensure that if this span does have non-zero day/week units,
-    /// then callers have either provided a civil relative date or the special
-    /// `SpanRelativeTo::days_are_24_hours()` marker.
+    /// This includes days and weeks, even though they can be of varying
+    /// length during time zone transitions. If this applies, then callers
+    /// should set the days and weeks to `0` before calling this routine.
+    ///
+    /// All units above weeks are always ignored.
     #[inline]
-    pub(crate) fn to_duration_invariant(&self) -> SignedDuration {
+    pub(crate) fn to_invariant_duration(&self) -> SignedDuration {
         // This guarantees, at compile time, that a maximal invariant Span
-        // (that is, all units are days or lower and all units are set to their
-        // maximum values) will still balance out to a number of seconds that
-        // fits into a `i64`. This in turn implies that a `SignedDuration` can
-        // represent all possible invariant positive spans.
+        // (that is, all units are weeks or lower and all units are set to
+        // their maximum values) will still balance out to a number of seconds
+        // that fits into a `i64`. This in turn implies that a `SignedDuration`
+        // can represent all possible invariant positive spans.
         const _FITS_IN_U64: () = {
             debug_assert!(
                 i64::MAX as i128
-                    > ((t::SpanWeeks::MAX
-                        * t::SECONDS_PER_CIVIL_WEEK.bound())
-                        + (t::SpanDays::MAX
-                            * t::SECONDS_PER_CIVIL_DAY.bound())
-                        + (t::SpanHours::MAX * t::SECONDS_PER_HOUR.bound())
-                        + (t::SpanMinutes::MAX
-                            * t::SECONDS_PER_MINUTE.bound())
-                        + t::SpanSeconds::MAX
-                        + (t::SpanMilliseconds::MAX
-                            / t::MILLIS_PER_SECOND.bound())
-                        + (t::SpanMicroseconds::MAX
-                            / t::MICROS_PER_SECOND.bound())
-                        + (t::SpanNanoseconds::MAX
-                            / t::NANOS_PER_SECOND.bound())),
+                    > ((b::SpanWeeks::MAX as i128 * b::SECS_PER_WEEK as i128)
+                        + (b::SpanDays::MAX as i128
+                            * b::SECS_PER_CIVIL_DAY as i128)
+                        + (b::SpanHours::MAX as i128
+                            * b::SECS_PER_HOUR as i128)
+                        + (b::SpanMinutes::MAX as i128
+                            * b::SECS_PER_MIN as i128)
+                        + b::SpanSeconds::MAX as i128
+                        + (b::SpanMilliseconds::MAX as i128
+                            / b::MILLIS_PER_SEC as i128)
+                        + (b::SpanMicroseconds::MAX as i128
+                            / b::MICROS_PER_SEC as i128)
+                        + (b::SpanNanoseconds::MAX as i128
+                            / b::NANOS_PER_SEC as i128)),
             );
             ()
         };
 
-        let nanos = self.to_invariant_nanoseconds();
-        debug_assert!(
-            self.largest_unit() <= Unit::Week,
-            "units must be weeks or lower"
-        );
+        // OK because we have a compile time assert above that ensures our
+        // nanoseconds are in the valid range of a `SignedDuration`.
+        SignedDuration::from_civil_weeks32(self.get_weeks())
+            + SignedDuration::from_civil_days32(self.get_days())
+            + SignedDuration::from_hours32(self.get_hours())
+            + SignedDuration::from_mins(self.get_minutes())
+            + SignedDuration::from_secs(self.get_seconds())
+            + SignedDuration::from_millis(self.get_milliseconds())
+            + SignedDuration::from_micros(self.get_microseconds())
+            + SignedDuration::from_nanos(self.get_nanoseconds())
+    }
 
-        let seconds = nanos / t::NANOS_PER_SECOND;
-        let seconds = i64::from(seconds);
-        let subsec_nanos = nanos % t::NANOS_PER_SECOND;
-        // OK because % 1_000_000_000 above guarantees that the result fits
-        // in a i32.
-        let subsec_nanos = i32::try_from(subsec_nanos).unwrap();
+    /// Like `Span::to_invariant_duration`, except only considers units of
+    /// hours and lower. All bigger units are ignored.
+    #[inline]
+    pub(crate) fn to_invariant_duration_time_only(&self) -> SignedDuration {
+        // This guarantees, at compile time, that a maximal invariant Span
+        // (that is, all units are weeks or lower and all units are set to
+        // their maximum values) will still balance out to a number of seconds
+        // that fits into a `i64`. This in turn implies that a `SignedDuration`
+        // can represent all possible invariant positive spans.
+        const _FITS_IN_U64: () = {
+            debug_assert!(
+                i64::MAX as i128
+                    > ((b::SpanHours::MAX as i128 * b::SECS_PER_HOUR as i128)
+                        + (b::SpanMinutes::MAX as i128
+                            * b::SECS_PER_MIN as i128)
+                        + b::SpanSeconds::MAX as i128
+                        + (b::SpanMilliseconds::MAX as i128
+                            / b::MILLIS_PER_SEC as i128)
+                        + (b::SpanMicroseconds::MAX as i128
+                            / b::MICROS_PER_SEC as i128)
+                        + (b::SpanNanoseconds::MAX as i128
+                            / b::NANOS_PER_SEC as i128)),
+            );
+            ()
+        };
 
-        // SignedDuration::new can panic if |subsec_nanos| >= 1_000_000_000
-        // and seconds == {i64::MIN,i64::MAX}. But this can never happen
-        // because we guaranteed by construction above that |subsec_nanos| <
-        // 1_000_000_000.
-        SignedDuration::new(seconds, subsec_nanos)
+        // OK because we have a compile time assert above that ensures our
+        // nanoseconds are in the valid range of a `SignedDuration`.
+        SignedDuration::from_hours32(self.get_hours())
+            + SignedDuration::from_mins(self.get_minutes())
+            + SignedDuration::from_secs(self.get_seconds())
+            + SignedDuration::from_millis(self.get_milliseconds())
+            + SignedDuration::from_micros(self.get_microseconds())
+            + SignedDuration::from_nanos(self.get_nanoseconds())
     }
 }
 
 /// Crate internal APIs that operate on ranged integer types.
 impl Span {
     #[inline]
-    pub(crate) fn years_ranged(self, years: t::SpanYears) -> Span {
-        let mut span = Span { years: years.abs(), ..self };
-        span.sign = self.resign(years, &span);
-        span.units = span.units.set(Unit::Year, years == C(0));
-        span
+    fn try_unit(self, unit: Unit, value: i64) -> Result<Span, Error> {
+        match unit {
+            Unit::Year => self.try_years(value),
+            Unit::Month => self.try_months(value),
+            Unit::Week => self.try_weeks(value),
+            Unit::Day => self.try_days(value),
+            Unit::Hour => self.try_hours(value),
+            Unit::Minute => self.try_minutes(value),
+            Unit::Second => self.try_seconds(value),
+            Unit::Millisecond => self.try_milliseconds(value),
+            Unit::Microsecond => self.try_microseconds(value),
+            Unit::Nanosecond => self.try_nanoseconds(value),
+        }
     }
 
     #[inline]
-    pub(crate) fn months_ranged(self, months: t::SpanMonths) -> Span {
-        let mut span = Span { months: months.abs(), ..self };
-        span.sign = self.resign(months, &span);
-        span.units = span.units.set(Unit::Month, months == C(0));
-        span
+    pub(crate) fn get_years_unsigned(&self) -> u16 {
+        self.years as u16
     }
 
     #[inline]
-    pub(crate) fn weeks_ranged(self, weeks: t::SpanWeeks) -> Span {
-        let mut span = Span { weeks: weeks.abs(), ..self };
-        span.sign = self.resign(weeks, &span);
-        span.units = span.units.set(Unit::Week, weeks == C(0));
-        span
+    pub(crate) fn get_months_unsigned(&self) -> u32 {
+        self.months as u32
     }
 
     #[inline]
-    pub(crate) fn days_ranged(self, days: t::SpanDays) -> Span {
-        let mut span = Span { days: days.abs(), ..self };
-        span.sign = self.resign(days, &span);
-        span.units = span.units.set(Unit::Day, days == C(0));
-        span
+    pub(crate) fn get_weeks_unsigned(&self) -> u32 {
+        self.weeks as u32
     }
 
     #[inline]
-    pub(crate) fn hours_ranged(self, hours: t::SpanHours) -> Span {
-        let mut span = Span { hours: hours.abs(), ..self };
-        span.sign = self.resign(hours, &span);
-        span.units = span.units.set(Unit::Hour, hours == C(0));
-        span
+    pub(crate) fn get_days_unsigned(&self) -> u32 {
+        self.days as u32
     }
 
     #[inline]
-    pub(crate) fn minutes_ranged(self, minutes: t::SpanMinutes) -> Span {
-        let mut span = Span { minutes: minutes.abs(), ..self };
-        span.sign = self.resign(minutes, &span);
-        span.units = span.units.set(Unit::Minute, minutes == C(0));
-        span
+    pub(crate) fn get_hours_unsigned(&self) -> u32 {
+        self.hours as u32
     }
 
     #[inline]
-    pub(crate) fn seconds_ranged(self, seconds: t::SpanSeconds) -> Span {
-        let mut span = Span { seconds: seconds.abs(), ..self };
-        span.sign = self.resign(seconds, &span);
-        span.units = span.units.set(Unit::Second, seconds == C(0));
-        span
+    pub(crate) fn get_minutes_unsigned(&self) -> u64 {
+        self.minutes as u64
     }
 
     #[inline]
-    fn milliseconds_ranged(self, milliseconds: t::SpanMilliseconds) -> Span {
-        let mut span = Span { milliseconds: milliseconds.abs(), ..self };
-        span.sign = self.resign(milliseconds, &span);
-        span.units = span.units.set(Unit::Millisecond, milliseconds == C(0));
-        span
+    pub(crate) fn get_seconds_unsigned(&self) -> u64 {
+        self.seconds as u64
     }
 
     #[inline]
-    fn microseconds_ranged(self, microseconds: t::SpanMicroseconds) -> Span {
-        let mut span = Span { microseconds: microseconds.abs(), ..self };
-        span.sign = self.resign(microseconds, &span);
-        span.units = span.units.set(Unit::Microsecond, microseconds == C(0));
-        span
+    pub(crate) fn get_milliseconds_unsigned(&self) -> u64 {
+        self.milliseconds as u64
     }
 
     #[inline]
-    pub(crate) fn nanoseconds_ranged(
-        self,
-        nanoseconds: t::SpanNanoseconds,
-    ) -> Span {
-        let mut span = Span { nanoseconds: nanoseconds.abs(), ..self };
-        span.sign = self.resign(nanoseconds, &span);
-        span.units = span.units.set(Unit::Nanosecond, nanoseconds == C(0));
-        span
+    pub(crate) fn get_microseconds_unsigned(&self) -> u64 {
+        self.microseconds as u64
     }
 
     #[inline]
-    fn try_days_ranged(
-        self,
-        days: impl TryRInto<t::SpanDays>,
-    ) -> Result<Span, Error> {
-        let days = days.try_rinto("days")?;
-        Ok(self.days_ranged(days))
+    pub(crate) fn get_nanoseconds_unsigned(&self) -> u64 {
+        self.nanoseconds as u64
     }
 
     #[inline]
-    pub(crate) fn try_hours_ranged(
-        self,
-        hours: impl TryRInto<t::SpanHours>,
-    ) -> Result<Span, Error> {
-        let hours = hours.try_rinto("hours")?;
-        Ok(self.hours_ranged(hours))
-    }
-
-    #[inline]
-    pub(crate) fn try_minutes_ranged(
-        self,
-        minutes: impl TryRInto<t::SpanMinutes>,
-    ) -> Result<Span, Error> {
-        let minutes = minutes.try_rinto("minutes")?;
-        Ok(self.minutes_ranged(minutes))
-    }
-
-    #[inline]
-    pub(crate) fn try_seconds_ranged(
-        self,
-        seconds: impl TryRInto<t::SpanSeconds>,
-    ) -> Result<Span, Error> {
-        let seconds = seconds.try_rinto("seconds")?;
-        Ok(self.seconds_ranged(seconds))
-    }
-
-    #[inline]
-    pub(crate) fn try_milliseconds_ranged(
-        self,
-        milliseconds: impl TryRInto<t::SpanMilliseconds>,
-    ) -> Result<Span, Error> {
-        let milliseconds = milliseconds.try_rinto("milliseconds")?;
-        Ok(self.milliseconds_ranged(milliseconds))
-    }
-
-    #[inline]
-    pub(crate) fn try_microseconds_ranged(
-        self,
-        microseconds: impl TryRInto<t::SpanMicroseconds>,
-    ) -> Result<Span, Error> {
-        let microseconds = microseconds.try_rinto("microseconds")?;
-        Ok(self.microseconds_ranged(microseconds))
-    }
-
-    #[inline]
-    pub(crate) fn try_nanoseconds_ranged(
-        self,
-        nanoseconds: impl TryRInto<t::SpanNanoseconds>,
-    ) -> Result<Span, Error> {
-        let nanoseconds = nanoseconds.try_rinto("nanoseconds")?;
-        Ok(self.nanoseconds_ranged(nanoseconds))
-    }
-
-    #[inline]
-    pub(crate) fn try_units_ranged(
-        self,
-        unit: Unit,
-        value: NoUnits,
-    ) -> Result<Span, Error> {
-        Ok(match unit {
-            Unit::Year => self.years_ranged(value.try_rinto("years")?),
-            Unit::Month => self.months_ranged(value.try_rinto("months")?),
-            Unit::Week => self.weeks_ranged(value.try_rinto("weeks")?),
-            Unit::Day => self.days_ranged(value.try_rinto("days")?),
-            Unit::Hour => self.hours_ranged(value.try_rinto("hours")?),
-            Unit::Minute => self.minutes_ranged(value.try_rinto("minutes")?),
-            Unit::Second => self.seconds_ranged(value.try_rinto("seconds")?),
-            Unit::Millisecond => {
-                self.milliseconds_ranged(value.try_rinto("milliseconds")?)
-            }
-            Unit::Microsecond => {
-                self.microseconds_ranged(value.try_rinto("microseconds")?)
-            }
-            Unit::Nanosecond => {
-                self.nanoseconds_ranged(value.try_rinto("nanoseconds")?)
-            }
-        })
-    }
-
-    #[inline]
-    pub(crate) fn get_years_ranged(&self) -> t::SpanYears {
-        self.years * self.sign
-    }
-
-    #[inline]
-    pub(crate) fn get_months_ranged(&self) -> t::SpanMonths {
-        self.months * self.sign
-    }
-
-    #[inline]
-    pub(crate) fn get_weeks_ranged(&self) -> t::SpanWeeks {
-        self.weeks * self.sign
-    }
-
-    #[inline]
-    pub(crate) fn get_days_ranged(&self) -> t::SpanDays {
-        self.days * self.sign
-    }
-
-    #[inline]
-    pub(crate) fn get_hours_ranged(&self) -> t::SpanHours {
-        self.hours * self.sign
-    }
-
-    #[inline]
-    pub(crate) fn get_minutes_ranged(&self) -> t::SpanMinutes {
-        self.minutes * self.sign
-    }
-
-    #[inline]
-    pub(crate) fn get_seconds_ranged(&self) -> t::SpanSeconds {
-        self.seconds * self.sign
-    }
-
-    #[inline]
-    pub(crate) fn get_milliseconds_ranged(&self) -> t::SpanMilliseconds {
-        self.milliseconds * self.sign
-    }
-
-    #[inline]
-    pub(crate) fn get_microseconds_ranged(&self) -> t::SpanMicroseconds {
-        self.microseconds * self.sign
-    }
-
-    #[inline]
-    pub(crate) fn get_nanoseconds_ranged(&self) -> t::SpanNanoseconds {
-        self.nanoseconds * self.sign
-    }
-
-    #[inline]
-    fn get_sign_ranged(&self) -> ri8<-1, 1> {
+    fn get_sign(&self) -> b::Sign {
         self.sign
     }
 
     #[inline]
-    fn get_units_ranged(&self, unit: Unit) -> NoUnits {
+    fn get_unit(&self, unit: Unit) -> i64 {
         match unit {
-            Unit::Year => self.get_years_ranged().rinto(),
-            Unit::Month => self.get_months_ranged().rinto(),
-            Unit::Week => self.get_weeks_ranged().rinto(),
-            Unit::Day => self.get_days_ranged().rinto(),
-            Unit::Hour => self.get_hours_ranged().rinto(),
-            Unit::Minute => self.get_minutes_ranged().rinto(),
-            Unit::Second => self.get_seconds_ranged().rinto(),
-            Unit::Millisecond => self.get_milliseconds_ranged().rinto(),
-            Unit::Microsecond => self.get_microseconds_ranged().rinto(),
-            Unit::Nanosecond => self.get_nanoseconds_ranged().rinto(),
+            Unit::Year => self.get_years().into(),
+            Unit::Month => self.get_months().into(),
+            Unit::Week => self.get_weeks().into(),
+            Unit::Day => self.get_days().into(),
+            Unit::Hour => self.get_hours().into(),
+            Unit::Minute => self.get_minutes(),
+            Unit::Second => self.get_seconds(),
+            Unit::Millisecond => self.get_milliseconds(),
+            Unit::Microsecond => self.get_microseconds(),
+            Unit::Nanosecond => self.get_nanoseconds(),
         }
+    }
+}
+
+/// Crate internal APIs that permit setting units without checks.
+///
+/// Callers should be very careful when using these. These notably also do
+/// not handle updating the sign on the `Span` and require the precisely
+/// correct integer primitive.
+impl Span {
+    #[inline]
+    pub(crate) fn years_unchecked(mut self, years: i16) -> Span {
+        self.years = years;
+        self.units = self.units.set(Unit::Year, years == 0);
+        self
+    }
+
+    #[inline]
+    pub(crate) fn months_unchecked(mut self, months: i32) -> Span {
+        self.months = months;
+        self.units = self.units.set(Unit::Month, months == 0);
+        self
+    }
+
+    #[inline]
+    pub(crate) fn weeks_unchecked(mut self, weeks: i32) -> Span {
+        self.weeks = weeks;
+        self.units = self.units.set(Unit::Week, weeks == 0);
+        self
+    }
+
+    #[inline]
+    pub(crate) fn days_unchecked(mut self, days: i32) -> Span {
+        self.days = days;
+        self.units = self.units.set(Unit::Day, days == 0);
+        self
+    }
+
+    #[inline]
+    pub(crate) fn hours_unchecked(mut self, hours: i32) -> Span {
+        self.hours = hours;
+        self.units = self.units.set(Unit::Hour, hours == 0);
+        self
+    }
+
+    #[inline]
+    pub(crate) fn minutes_unchecked(mut self, minutes: i64) -> Span {
+        self.minutes = minutes;
+        self.units = self.units.set(Unit::Minute, minutes == 0);
+        self
+    }
+
+    #[inline]
+    pub(crate) fn seconds_unchecked(mut self, seconds: i64) -> Span {
+        self.seconds = seconds;
+        self.units = self.units.set(Unit::Second, seconds == 0);
+        self
+    }
+
+    #[inline]
+    pub(crate) fn milliseconds_unchecked(mut self, milliseconds: i64) -> Span {
+        self.milliseconds = milliseconds;
+        self.units = self.units.set(Unit::Millisecond, milliseconds == 0);
+        self
+    }
+
+    #[inline]
+    pub(crate) fn microseconds_unchecked(mut self, microseconds: i64) -> Span {
+        self.microseconds = microseconds;
+        self.units = self.units.set(Unit::Microsecond, microseconds == 0);
+        self
+    }
+
+    #[inline]
+    pub(crate) fn nanoseconds_unchecked(mut self, nanoseconds: i64) -> Span {
+        self.nanoseconds = nanoseconds;
+        self.units = self.units.set(Unit::Nanosecond, nanoseconds == 0);
+        self
+    }
+
+    #[inline]
+    pub(crate) fn sign_unchecked(self, sign: b::Sign) -> Span {
+        Span { sign, ..self }
     }
 }
 
 /// Crate internal helper routines.
 impl Span {
-    /// Converts the given number of nanoseconds to a `Span` whose units do not
+    /// Converts the given duration to a `Span` whose units do not
     /// exceed `largest`.
     ///
     /// Note that `largest` is capped at `Unit::Week`. Note though that if
@@ -2739,286 +2672,127 @@ impl Span {
     /// are always 24 hours long. Callers needing to deal with variable length
     /// days should do so outside of this routine and should not provide a
     /// `largest` unit bigger than `Unit::Hour`.
-    pub(crate) fn from_invariant_nanoseconds(
+    pub(crate) fn from_invariant_duration(
         largest: Unit,
-        nanos: NoUnits128,
+        mut dur: SignedDuration,
     ) -> Result<Span, Error> {
         let mut span = Span::new();
-        match largest {
-            Unit::Week => {
-                let micros = nanos.div_ceil(t::NANOS_PER_MICRO);
-                span = span.try_nanoseconds_ranged(
-                    nanos.rem_ceil(t::NANOS_PER_MICRO),
-                )?;
-                let millis = micros.div_ceil(t::MICROS_PER_MILLI);
-                span = span.try_microseconds_ranged(
-                    micros.rem_ceil(t::MICROS_PER_MILLI),
-                )?;
-                let secs = millis.div_ceil(t::MILLIS_PER_SECOND);
-                span = span.try_milliseconds_ranged(
-                    millis.rem_ceil(t::MILLIS_PER_SECOND),
-                )?;
-                let mins = secs.div_ceil(t::SECONDS_PER_MINUTE);
-                span = span.try_seconds_ranged(
-                    secs.rem_ceil(t::SECONDS_PER_MINUTE),
-                )?;
-                let hours = mins.div_ceil(t::MINUTES_PER_HOUR);
-                span = span
-                    .try_minutes_ranged(mins.rem_ceil(t::MINUTES_PER_HOUR))?;
-                let days = hours.div_ceil(t::HOURS_PER_CIVIL_DAY);
-                span = span.try_hours_ranged(
-                    hours.rem_ceil(t::HOURS_PER_CIVIL_DAY),
-                )?;
-                let weeks = days.div_ceil(t::DAYS_PER_CIVIL_WEEK);
-                span = span
-                    .try_days_ranged(days.rem_ceil(t::DAYS_PER_CIVIL_WEEK))?;
-                span = span.weeks_ranged(weeks.try_rinto("weeks")?);
-                Ok(span)
-            }
-            Unit::Year | Unit::Month | Unit::Day => {
-                // Unit::Year | Unit::Month | Unit::Week | Unit::Day => {
-                let micros = nanos.div_ceil(t::NANOS_PER_MICRO);
-                span = span.try_nanoseconds_ranged(
-                    nanos.rem_ceil(t::NANOS_PER_MICRO),
-                )?;
-                let millis = micros.div_ceil(t::MICROS_PER_MILLI);
-                span = span.try_microseconds_ranged(
-                    micros.rem_ceil(t::MICROS_PER_MILLI),
-                )?;
-                let secs = millis.div_ceil(t::MILLIS_PER_SECOND);
-                span = span.try_milliseconds_ranged(
-                    millis.rem_ceil(t::MILLIS_PER_SECOND),
-                )?;
-                let mins = secs.div_ceil(t::SECONDS_PER_MINUTE);
-                span = span.try_seconds_ranged(
-                    secs.rem_ceil(t::SECONDS_PER_MINUTE),
-                )?;
-                let hours = mins.div_ceil(t::MINUTES_PER_HOUR);
-                span = span
-                    .try_minutes_ranged(mins.rem_ceil(t::MINUTES_PER_HOUR))?;
-                let days = hours.div_ceil(t::HOURS_PER_CIVIL_DAY);
-                span = span.try_hours_ranged(
-                    hours.rem_ceil(t::HOURS_PER_CIVIL_DAY),
-                )?;
-                span = span.try_days_ranged(days)?;
-                Ok(span)
-            }
-            Unit::Hour => {
-                let micros = nanos.div_ceil(t::NANOS_PER_MICRO);
-                span = span.try_nanoseconds_ranged(
-                    nanos.rem_ceil(t::NANOS_PER_MICRO),
-                )?;
-                let millis = micros.div_ceil(t::MICROS_PER_MILLI);
-                span = span.try_microseconds_ranged(
-                    micros.rem_ceil(t::MICROS_PER_MILLI),
-                )?;
-                let secs = millis.div_ceil(t::MILLIS_PER_SECOND);
-                span = span.try_milliseconds_ranged(
-                    millis.rem_ceil(t::MILLIS_PER_SECOND),
-                )?;
-                let mins = secs.div_ceil(t::SECONDS_PER_MINUTE);
-                span = span.try_seconds_ranged(
-                    secs.rem_ceil(t::SECONDS_PER_MINUTE),
-                )?;
-                let hours = mins.div_ceil(t::MINUTES_PER_HOUR);
-                span = span
-                    .try_minutes_ranged(mins.rem_ceil(t::MINUTES_PER_HOUR))?;
-                span = span.try_hours_ranged(hours)?;
-                Ok(span)
-            }
-            Unit::Minute => {
-                let micros = nanos.div_ceil(t::NANOS_PER_MICRO);
-                span = span.try_nanoseconds_ranged(
-                    nanos.rem_ceil(t::NANOS_PER_MICRO),
-                )?;
-                let millis = micros.div_ceil(t::MICROS_PER_MILLI);
-                span = span.try_microseconds_ranged(
-                    micros.rem_ceil(t::MICROS_PER_MILLI),
-                )?;
-                let secs = millis.div_ceil(t::MILLIS_PER_SECOND);
-                span = span.try_milliseconds_ranged(
-                    millis.rem_ceil(t::MILLIS_PER_SECOND),
-                )?;
-                let mins = secs.div_ceil(t::SECONDS_PER_MINUTE);
-                span =
-                    span.try_seconds(secs.rem_ceil(t::SECONDS_PER_MINUTE))?;
-                span = span.try_minutes_ranged(mins)?;
-                Ok(span)
-            }
-            Unit::Second => {
-                let micros = nanos.div_ceil(t::NANOS_PER_MICRO);
-                span = span.try_nanoseconds_ranged(
-                    nanos.rem_ceil(t::NANOS_PER_MICRO),
-                )?;
-                let millis = micros.div_ceil(t::MICROS_PER_MILLI);
-                span = span.try_microseconds_ranged(
-                    micros.rem_ceil(t::MICROS_PER_MILLI),
-                )?;
-                let secs = millis.div_ceil(t::MILLIS_PER_SECOND);
-                span = span.try_milliseconds_ranged(
-                    millis.rem_ceil(t::MILLIS_PER_SECOND),
-                )?;
-                span = span.try_seconds_ranged(secs)?;
-                Ok(span)
-            }
-            Unit::Millisecond => {
-                let micros = nanos.div_ceil(t::NANOS_PER_MICRO);
-                span = span.try_nanoseconds_ranged(
-                    nanos.rem_ceil(t::NANOS_PER_MICRO),
-                )?;
-                let millis = micros.div_ceil(t::MICROS_PER_MILLI);
-                span = span.try_microseconds_ranged(
-                    micros.rem_ceil(t::MICROS_PER_MILLI),
-                )?;
-                span = span.try_milliseconds_ranged(millis)?;
-                Ok(span)
-            }
-            Unit::Microsecond => {
-                let micros = nanos.div_ceil(t::NANOS_PER_MICRO);
-                span = span.try_nanoseconds_ranged(
-                    nanos.rem_ceil(t::NANOS_PER_MICRO),
-                )?;
-                span = span.try_microseconds_ranged(micros)?;
-                Ok(span)
-            }
-            Unit::Nanosecond => {
-                span = span.try_nanoseconds_ranged(nanos)?;
-                Ok(span)
-            }
+
+        if matches!(largest, Unit::Week) {
+            let (weeks, rem) = dur.as_civil_weeks_with_remainder();
+            span = span.try_weeks(weeks)?;
+            dur = rem;
         }
-    }
-
-    /// Converts the non-variable units of this `Span` to a total number of
-    /// nanoseconds.
-    ///
-    /// This includes days and weeks, even though they can be of irregular
-    /// length during time zone transitions. If this applies, then callers
-    /// should set the days and weeks to `0` before calling this routine.
-    ///
-    /// All units above weeks are always ignored.
-    #[inline]
-    pub(crate) fn to_invariant_nanoseconds(&self) -> NoUnits128 {
-        let mut nanos = NoUnits128::rfrom(self.get_nanoseconds_ranged());
-        nanos += NoUnits128::rfrom(self.get_microseconds_ranged())
-            * t::NANOS_PER_MICRO;
-        nanos += NoUnits128::rfrom(self.get_milliseconds_ranged())
-            * t::NANOS_PER_MILLI;
-        nanos +=
-            NoUnits128::rfrom(self.get_seconds_ranged()) * t::NANOS_PER_SECOND;
-        nanos +=
-            NoUnits128::rfrom(self.get_minutes_ranged()) * t::NANOS_PER_MINUTE;
-        nanos +=
-            NoUnits128::rfrom(self.get_hours_ranged()) * t::NANOS_PER_HOUR;
-        nanos +=
-            NoUnits128::rfrom(self.get_days_ranged()) * t::NANOS_PER_CIVIL_DAY;
-        nanos += NoUnits128::rfrom(self.get_weeks_ranged())
-            * t::NANOS_PER_CIVIL_WEEK;
-        nanos
-    }
-
-    /// Converts the non-variable units of this `Span` to a total number of
-    /// seconds if there is no fractional second component. Otherwise,
-    /// `None` is returned.
-    ///
-    /// This is useful for short-circuiting in arithmetic operations when
-    /// it's faster to only deal with seconds. And in particular, acknowledges
-    /// that nanosecond precision durations are somewhat rare.
-    ///
-    /// This includes days and weeks, even though they can be of irregular
-    /// length during time zone transitions. If this applies, then callers
-    /// should set the days and weeks to `0` before calling this routine.
-    ///
-    /// All units above weeks are always ignored.
-    #[inline]
-    pub(crate) fn to_invariant_seconds(&self) -> Option<NoUnits> {
-        if self.has_fractional_seconds() {
-            return None;
+        if largest >= Unit::Day {
+            let (days, rem) = dur.as_civil_days_with_remainder();
+            span = span.try_days(days)?;
+            dur = rem;
         }
-        let mut seconds = NoUnits::rfrom(self.get_seconds_ranged());
-        seconds +=
-            NoUnits::rfrom(self.get_minutes_ranged()) * t::SECONDS_PER_MINUTE;
-        seconds +=
-            NoUnits::rfrom(self.get_hours_ranged()) * t::SECONDS_PER_HOUR;
-        seconds +=
-            NoUnits::rfrom(self.get_days_ranged()) * t::SECONDS_PER_CIVIL_DAY;
-        seconds += NoUnits::rfrom(self.get_weeks_ranged())
-            * t::SECONDS_PER_CIVIL_WEEK;
-        Some(seconds)
+        if largest >= Unit::Hour {
+            let (hours, rem) = dur.as_hours_with_remainder();
+            span = span.try_hours(hours)?;
+            dur = rem;
+        }
+        if largest >= Unit::Minute {
+            let (mins, rem) = dur.as_mins_with_remainder();
+            span = span.try_minutes(mins)?;
+            dur = rem;
+        }
+        if largest >= Unit::Second {
+            let (secs, rem) = dur.as_secs_with_remainder();
+            span = span.try_seconds(secs)?;
+            dur = rem;
+        }
+        if largest >= Unit::Millisecond {
+            let (millis, rem) = dur.as_millis_with_remainder();
+            let millis = i64::try_from(millis)
+                .map_err(|_| b::SpanMilliseconds::error())?;
+            span = span.try_milliseconds(millis)?;
+            dur = rem;
+        }
+        if largest >= Unit::Microsecond {
+            let (micros, rem) = dur.as_micros_with_remainder();
+            let micros = i64::try_from(micros)
+                .map_err(|_| b::SpanMicroseconds::error())?;
+            span = span.try_microseconds(micros)?;
+            dur = rem;
+        }
+        if largest >= Unit::Nanosecond {
+            let nanos = i64::try_from(dur.as_nanos())
+                .map_err(|_| b::SpanNanoseconds::error())?;
+            span = span.try_nanoseconds(nanos)?;
+        }
+
+        Ok(span)
     }
 
-    /// Rebalances the invariant units (days or lower) on this span so that
-    /// the largest possible non-zero unit is the one given.
+    /// Converts the hour, minute and second units in this `Span` to seconds.
     ///
-    /// Units above day are ignored and dropped.
-    ///
-    /// If the given unit is greater than days, then it is treated as-if it
-    /// were days.
-    ///
-    /// # Errors
-    ///
-    /// This can return an error in the case of lop-sided units. For example,
-    /// if this span has maximal values for all units, then rebalancing is
-    /// not possible because the number of days after balancing would exceed
-    /// the limit.
-    #[cfg(test)] // currently only used in zic parser?
+    /// This ignores all other units.
     #[inline]
-    pub(crate) fn rebalance(self, unit: Unit) -> Result<Span, Error> {
-        Span::from_invariant_nanoseconds(unit, self.to_invariant_nanoseconds())
+    pub(crate) fn to_hms_seconds(&self) -> i64 {
+        // This can never overflow because the maximal values for hours,
+        // minutes and seconds (even when combined) can fit into an `i64`.
+        let mut secs = self.seconds;
+        secs += self.minutes * b::SECS_PER_MIN;
+        secs += i64::from(self.hours) * b::SECS_PER_HOUR;
+        self.sign * secs
     }
 
     /// Returns true if and only if this span has at least one non-zero
     /// fractional second unit.
     #[inline]
     pub(crate) fn has_fractional_seconds(&self) -> bool {
-        self.milliseconds != C(0)
-            || self.microseconds != C(0)
-            || self.nanoseconds != C(0)
+        static SUBSECOND: UnitSet = UnitSet::from_slice(&[
+            Unit::Millisecond,
+            Unit::Microsecond,
+            Unit::Nanosecond,
+        ]);
+        !self.units().intersection(SUBSECOND).is_empty()
     }
 
     /// Returns an equivalent span, but with all non-calendar (units below
     /// days) set to zero.
     #[cfg_attr(feature = "perf-inline", inline(always))]
-    pub(crate) fn only_calendar(self) -> Span {
-        let mut span = self;
-        span.hours = t::SpanHours::N::<0>();
-        span.minutes = t::SpanMinutes::N::<0>();
-        span.seconds = t::SpanSeconds::N::<0>();
-        span.milliseconds = t::SpanMilliseconds::N::<0>();
-        span.microseconds = t::SpanMicroseconds::N::<0>();
-        span.nanoseconds = t::SpanNanoseconds::N::<0>();
-        if span.sign != C(0)
-            && span.years == C(0)
-            && span.months == C(0)
-            && span.weeks == C(0)
-            && span.days == C(0)
+    pub(crate) fn only_calendar(mut self) -> Span {
+        self.hours = 0;
+        self.minutes = 0;
+        self.seconds = 0;
+        self.milliseconds = 0;
+        self.microseconds = 0;
+        self.nanoseconds = 0;
+        if !self.sign.is_zero()
+            && self.years == 0
+            && self.months == 0
+            && self.weeks == 0
+            && self.days == 0
         {
-            span.sign = t::Sign::N::<0>();
+            self.sign = b::Sign::Zero;
         }
-        span.units = span.units.only_calendar();
-        span
+        self.units = self.units.only_calendar();
+        self
     }
 
     /// Returns an equivalent span, but with all calendar (units above
     /// hours) set to zero.
     #[cfg_attr(feature = "perf-inline", inline(always))]
-    pub(crate) fn only_time(self) -> Span {
-        let mut span = self;
-        span.years = t::SpanYears::N::<0>();
-        span.months = t::SpanMonths::N::<0>();
-        span.weeks = t::SpanWeeks::N::<0>();
-        span.days = t::SpanDays::N::<0>();
-        if span.sign != C(0)
-            && span.hours == C(0)
-            && span.minutes == C(0)
-            && span.seconds == C(0)
-            && span.milliseconds == C(0)
-            && span.microseconds == C(0)
-            && span.nanoseconds == C(0)
+    pub(crate) fn only_time(mut self) -> Span {
+        self.years = 0;
+        self.months = 0;
+        self.weeks = 0;
+        self.days = 0;
+        if !self.sign.is_zero()
+            && self.hours == 0
+            && self.minutes == 0
+            && self.seconds == 0
+            && self.milliseconds == 0
+            && self.microseconds == 0
+            && self.nanoseconds == 0
         {
-            span.sign = t::Sign::N::<0>();
+            self.sign = b::Sign::Zero;
         }
-        span.units = span.units.only_time();
-        span
+        self.units = self.units.only_time();
+        self
     }
 
     /// Returns an equivalent span, but with all units greater than or equal to
@@ -3028,31 +2802,31 @@ impl Span {
         let mut span = self;
         // Unit::Nanosecond is the minimum, so nothing can be smaller than it.
         if unit <= Unit::Microsecond {
-            span = span.microseconds_ranged(C(0).rinto());
+            span = span.microseconds(0);
         }
         if unit <= Unit::Millisecond {
-            span = span.milliseconds_ranged(C(0).rinto());
+            span = span.milliseconds(0);
         }
         if unit <= Unit::Second {
-            span = span.seconds_ranged(C(0).rinto());
+            span = span.seconds(0);
         }
         if unit <= Unit::Minute {
-            span = span.minutes_ranged(C(0).rinto());
+            span = span.minutes(0);
         }
         if unit <= Unit::Hour {
-            span = span.hours_ranged(C(0).rinto());
+            span = span.hours(0);
         }
         if unit <= Unit::Day {
-            span = span.days_ranged(C(0).rinto());
+            span = span.days(0);
         }
         if unit <= Unit::Week {
-            span = span.weeks_ranged(C(0).rinto());
+            span = span.weeks(0);
         }
         if unit <= Unit::Month {
-            span = span.months_ranged(C(0).rinto());
+            span = span.months(0);
         }
         if unit <= Unit::Year {
-            span = span.years_ranged(C(0).rinto());
+            span = span.years(0);
         }
         span
     }
@@ -3063,31 +2837,31 @@ impl Span {
     pub(crate) fn without_lower(self, unit: Unit) -> Span {
         let mut span = self;
         if unit > Unit::Nanosecond {
-            span = span.nanoseconds_ranged(C(0).rinto());
+            span = span.nanoseconds(0);
         }
         if unit > Unit::Microsecond {
-            span = span.microseconds_ranged(C(0).rinto());
+            span = span.microseconds(0);
         }
         if unit > Unit::Millisecond {
-            span = span.milliseconds_ranged(C(0).rinto());
+            span = span.milliseconds(0);
         }
         if unit > Unit::Second {
-            span = span.seconds_ranged(C(0).rinto());
+            span = span.seconds(0);
         }
         if unit > Unit::Minute {
-            span = span.minutes_ranged(C(0).rinto());
+            span = span.minutes(0);
         }
         if unit > Unit::Hour {
-            span = span.hours_ranged(C(0).rinto());
+            span = span.hours(0);
         }
         if unit > Unit::Day {
-            span = span.days_ranged(C(0).rinto());
+            span = span.days(0);
         }
         if unit > Unit::Week {
-            span = span.weeks_ranged(C(0).rinto());
+            span = span.weeks(0);
         }
         if unit > Unit::Month {
-            span = span.months_ranged(C(0).rinto());
+            span = span.months(0);
         }
         // Unit::Year is the max, so nothing can be bigger than it.
         span
@@ -3101,19 +2875,15 @@ impl Span {
         &self,
     ) -> Option<Error> {
         let non_time_unit = self.largest_calendar_unit()?;
-        Some(err!(
-            "operation can only be performed with units of hours \
-             or smaller, but found non-zero {unit} units \
-             (operations on `Timestamp`, `tz::Offset` and `civil::Time` \
-              don't support calendar units in a `Span`)",
-            unit = non_time_unit.singular(),
-        ))
+        Some(Error::from(UnitConfigError::CalendarUnitsNotAllowed {
+            unit: non_time_unit,
+        }))
     }
 
     /// Returns the largest non-zero calendar unit, or `None` if there are no
     /// non-zero calendar units.
     #[inline]
-    pub(crate) fn largest_calendar_unit(&self) -> Option<Unit> {
+    fn largest_calendar_unit(&self) -> Option<Unit> {
         self.units().only_calendar().largest_unit()
     }
 
@@ -3145,95 +2915,75 @@ impl Span {
         let mut buf = alloc::string::String::new();
         write!(buf, "Span {{ sign: {:?}, units: {:?}", self.sign, self.units)
             .unwrap();
-        if self.years != C(0) {
+        if self.years != 0 {
             write!(buf, ", years: {:?}", self.years).unwrap();
         }
-        if self.months != C(0) {
+        if self.months != 0 {
             write!(buf, ", months: {:?}", self.months).unwrap();
         }
-        if self.weeks != C(0) {
+        if self.weeks != 0 {
             write!(buf, ", weeks: {:?}", self.weeks).unwrap();
         }
-        if self.days != C(0) {
+        if self.days != 0 {
             write!(buf, ", days: {:?}", self.days).unwrap();
         }
-        if self.hours != C(0) {
+        if self.hours != 0 {
             write!(buf, ", hours: {:?}", self.hours).unwrap();
         }
-        if self.minutes != C(0) {
+        if self.minutes != 0 {
             write!(buf, ", minutes: {:?}", self.minutes).unwrap();
         }
-        if self.seconds != C(0) {
+        if self.seconds != 0 {
             write!(buf, ", seconds: {:?}", self.seconds).unwrap();
         }
-        if self.milliseconds != C(0) {
+        if self.milliseconds != 0 {
             write!(buf, ", milliseconds: {:?}", self.milliseconds).unwrap();
         }
-        if self.microseconds != C(0) {
+        if self.microseconds != 0 {
             write!(buf, ", microseconds: {:?}", self.microseconds).unwrap();
         }
-        if self.nanoseconds != C(0) {
+        if self.nanoseconds != 0 {
             write!(buf, ", nanoseconds: {:?}", self.nanoseconds).unwrap();
         }
-        write!(buf, " }}").unwrap();
+        buf.push_str(" }}");
         buf
     }
 
     /// Given some new units to set on this span and the span updates with the
     /// new units, this determines the what the sign of `new` should be.
     #[inline]
-    fn resign(&self, units: impl RInto<NoUnits>, new: &Span) -> Sign {
-        fn imp(span: &Span, units: NoUnits, new: &Span) -> Sign {
+    fn resign(&self, units: impl Into<i64>, new: &Span) -> b::Sign {
+        fn imp(span: &Span, units: i64, new: &Span) -> b::Sign {
             // Negative units anywhere always makes the entire span negative.
-            if units < C(0) {
-                return Sign::N::<-1>();
+            if units.is_negative() {
+                return b::Sign::Negative;
             }
-            let mut new_is_zero = new.sign == C(0) && units == C(0);
+            let mut new_is_zero = new.sign.is_zero() && units == 0;
             // When `units == 0` and it was previously non-zero, then
             // `new.sign` won't be `0` and thus `new_is_zero` will be false
             // when it should be true. So in this case, we need to re-check all
             // the units to set the sign correctly.
-            if units == C(0) {
-                new_is_zero = new.years == C(0)
-                    && new.months == C(0)
-                    && new.weeks == C(0)
-                    && new.days == C(0)
-                    && new.hours == C(0)
-                    && new.minutes == C(0)
-                    && new.seconds == C(0)
-                    && new.milliseconds == C(0)
-                    && new.microseconds == C(0)
-                    && new.nanoseconds == C(0);
+            if units == 0 {
+                new_is_zero = new.years == 0
+                    && new.months == 0
+                    && new.weeks == 0
+                    && new.days == 0
+                    && new.hours == 0
+                    && new.minutes == 0
+                    && new.seconds == 0
+                    && new.milliseconds == 0
+                    && new.microseconds == 0
+                    && new.nanoseconds == 0;
             }
             match (span.is_zero(), new_is_zero) {
-                (_, true) => Sign::N::<0>(),
-                (true, false) => units.signum().rinto(),
-                // If the old and new span are both non-zero, and we know our new
-                // units are not negative, then the sign remains unchanged.
+                (_, true) => b::Sign::Zero,
+                (true, false) => b::Sign::from(units),
+                // If the old and new span are both non-zero, and we know our
+                // new units are not negative, then the sign remains unchanged.
                 (false, false) => new.sign,
             }
         }
-        imp(self, units.rinto(), new)
-    }
-}
-
-impl Default for Span {
-    #[inline]
-    fn default() -> Span {
-        Span {
-            sign: ri8::N::<0>(),
-            units: UnitSet::empty(),
-            years: C(0).rinto(),
-            months: C(0).rinto(),
-            weeks: C(0).rinto(),
-            days: C(0).rinto(),
-            hours: C(0).rinto(),
-            minutes: C(0).rinto(),
-            seconds: C(0).rinto(),
-            milliseconds: C(0).rinto(),
-            microseconds: C(0).rinto(),
-            nanoseconds: C(0).rinto(),
-        }
+        imp(self, units.into(), new)
     }
 }
 
@@ -3311,8 +3061,6 @@ impl core::ops::Mul<Span> for i64 {
 
 /// Converts a `Span` to a [`std::time::Duration`].
 ///
-/// Note that this assumes that days are always 24 hours long.
-///
 /// # Errors
 ///
 /// This can fail for only two reasons:
@@ -3378,10 +3126,7 @@ impl TryFrom<Span> for UnsignedDuration {
     fn try_from(sp: Span) -> Result<UnsignedDuration, Error> {
         // This isn't needed, but improves error messages.
         if sp.is_negative() {
-            return Err(err!(
-                "cannot convert negative span {sp:?} \
-                 to unsigned std::time::Duration",
-            ));
+            return Err(Error::from(E::ConvertNegative));
         }
         SignedDuration::try_from(sp).and_then(UnsignedDuration::try_from)
     }
@@ -3448,32 +3193,13 @@ impl TryFrom<UnsignedDuration> for Span {
 
     #[inline]
     fn try_from(d: UnsignedDuration) -> Result<Span, Error> {
-        let seconds = i64::try_from(d.as_secs()).map_err(|_| {
-            err!("seconds from {d:?} overflows a 64-bit signed integer")
-        })?;
-        let nanoseconds = i64::from(d.subsec_nanos());
-        let milliseconds = nanoseconds / t::NANOS_PER_MILLI.value();
-        let microseconds = (nanoseconds % t::NANOS_PER_MILLI.value())
-            / t::NANOS_PER_MICRO.value();
-        let nanoseconds = nanoseconds % t::NANOS_PER_MICRO.value();
-
-        let span = Span::new().try_seconds(seconds).with_context(|| {
-            err!("duration {d:?} overflows limits of a Jiff `Span`")
-        })?;
-        // These are all OK because `Duration::subsec_nanos` is guaranteed to
-        // return less than 1_000_000_000 nanoseconds. And splitting that up
-        // into millis, micros and nano components is guaranteed to fit into
-        // the limits of a `Span`.
-        Ok(span
-            .milliseconds(milliseconds)
-            .microseconds(microseconds)
-            .nanoseconds(nanoseconds))
+        let sdur = SignedDuration::try_from(d)
+            .map_err(|_| b::SpanSeconds::error())?;
+        Span::try_from(sdur)
     }
 }
 
 /// Converts a `Span` to a [`SignedDuration`].
-///
-/// Note that this assumes that days are always 24 hours long.
 ///
 /// # Errors
 ///
@@ -3513,11 +3239,9 @@ impl TryFrom<Span> for SignedDuration {
 
     #[inline]
     fn try_from(sp: Span) -> Result<SignedDuration, Error> {
-        requires_relative_date_err(sp.largest_unit()).context(
-            "failed to convert span to duration without relative datetime \
-             (must use `Span::to_duration` instead)",
-        )?;
-        Ok(sp.to_duration_invariant())
+        requires_relative_date_err(sp.largest_unit())
+            .context(E::ConvertSpanToSignedDuration)?;
+        Ok(sp.to_invariant_duration())
     }
 }
 
@@ -3580,14 +3304,12 @@ impl TryFrom<SignedDuration> for Span {
     fn try_from(d: SignedDuration) -> Result<Span, Error> {
         let seconds = d.as_secs();
         let nanoseconds = i64::from(d.subsec_nanos());
-        let milliseconds = nanoseconds / t::NANOS_PER_MILLI.value();
-        let microseconds = (nanoseconds % t::NANOS_PER_MILLI.value())
-            / t::NANOS_PER_MICRO.value();
-        let nanoseconds = nanoseconds % t::NANOS_PER_MICRO.value();
+        let milliseconds = nanoseconds / b::NANOS_PER_MILLI;
+        let microseconds =
+            (nanoseconds % b::NANOS_PER_MILLI) / b::NANOS_PER_MICRO;
+        let nanoseconds = nanoseconds % b::NANOS_PER_MICRO;
 
-        let span = Span::new().try_seconds(seconds).with_context(|| {
-            err!("signed duration {d:?} overflows limits of a Jiff `Span`")
-        })?;
+        let span = Span::new().try_seconds(seconds)?;
         // These are all OK because `|SignedDuration::subsec_nanos|` is
         // guaranteed to return less than 1_000_000_000 nanoseconds. And
         // splitting that up into millis, micros and nano components is
@@ -3600,9 +3322,9 @@ impl TryFrom<SignedDuration> for Span {
 }
 
 #[cfg(feature = "serde")]
-impl serde::Serialize for Span {
+impl serde_core::Serialize for Span {
     #[inline]
-    fn serialize<S: serde::Serializer>(
+    fn serialize<S: serde_core::Serializer>(
         &self,
         serializer: S,
     ) -> Result<S::Ok, S::Error> {
@@ -3611,12 +3333,12 @@ impl serde::Serialize for Span {
 }
 
 #[cfg(feature = "serde")]
-impl<'de> serde::Deserialize<'de> for Span {
+impl<'de> serde_core::Deserialize<'de> for Span {
     #[inline]
-    fn deserialize<D: serde::Deserializer<'de>>(
+    fn deserialize<D: serde_core::Deserializer<'de>>(
         deserializer: D,
     ) -> Result<Span, D::Error> {
-        use serde::de;
+        use serde_core::de;
 
         struct SpanVisitor;
 
@@ -3655,8 +3377,12 @@ impl quickcheck::Arbitrary for Span {
         // to provide a relative datetime. But if we do that, then it's
         // possible the span plus the datetime overflows. So we pick one
         // datetime and shrink the size of the span we can produce.
-        type Nanos = ri64<-631_107_417_600_000_000, 631_107_417_600_000_000>;
-        let nanos = Nanos::arbitrary(g).get();
+        const MIN: i64 = -631_107_417_600_000_000;
+        const MAX: i64 = 631_107_417_600_000_000;
+        const LEN: i64 = MAX - MIN + 1;
+
+        let mut nanos = i64::arbitrary(g).wrapping_rem_euclid(LEN);
+        nanos += MIN;
         let relative =
             SpanRelativeTo::from(DateTime::constant(0, 1, 1, 0, 0, 0, 0));
         let round =
@@ -3668,21 +3394,18 @@ impl quickcheck::Arbitrary for Span {
         alloc::boxed::Box::new(
             (
                 (
-                    self.get_years_ranged(),
-                    self.get_months_ranged(),
-                    self.get_weeks_ranged(),
-                    self.get_days_ranged(),
+                    self.get_years(),
+                    self.get_months(),
+                    self.get_weeks(),
+                    self.get_days(),
                 ),
                 (
-                    self.get_hours_ranged(),
-                    self.get_minutes_ranged(),
-                    self.get_seconds_ranged(),
-                    self.get_milliseconds_ranged(),
+                    self.get_hours(),
+                    self.get_minutes(),
+                    self.get_seconds(),
+                    self.get_milliseconds(),
                 ),
-                (
-                    self.get_microseconds_ranged(),
-                    self.get_nanoseconds_ranged(),
-                ),
+                (self.get_microseconds(), self.get_nanoseconds()),
             )
                 .shrink()
                 .filter_map(
@@ -3692,16 +3415,26 @@ impl quickcheck::Arbitrary for Span {
                         (microseconds, nanoseconds),
                     )| {
                         let span = Span::new()
-                            .years_ranged(years)
-                            .months_ranged(months)
-                            .weeks_ranged(weeks)
-                            .days_ranged(days)
-                            .hours_ranged(hours)
-                            .minutes_ranged(minutes)
-                            .seconds_ranged(seconds)
-                            .milliseconds_ranged(milliseconds)
-                            .microseconds_ranged(microseconds)
-                            .nanoseconds_ranged(nanoseconds);
+                            .try_years(years)
+                            .ok()?
+                            .try_months(months)
+                            .ok()?
+                            .try_weeks(weeks)
+                            .ok()?
+                            .try_days(days)
+                            .ok()?
+                            .try_hours(hours)
+                            .ok()?
+                            .try_minutes(minutes)
+                            .ok()?
+                            .try_seconds(seconds)
+                            .ok()?
+                            .try_milliseconds(milliseconds)
+                            .ok()?
+                            .try_microseconds(microseconds)
+                            .ok()?
+                            .try_nanoseconds(nanoseconds)
+                            .ok()?;
                         Some(span)
                     },
                 ),
@@ -4167,24 +3900,26 @@ impl Unit {
         }
     }
 
-    /// Returns the number of nanoseconds in this unit as a 128-bit integer.
+    /// Returns the number of nanoseconds in this unit as a 96-bit integer.
+    ///
+    /// This will treat weeks and days as invariant. Callers must ensure this
+    /// is appropriate to do.
     ///
     /// # Panics
     ///
     /// When this unit is always variable. That is, years or months.
-    pub(crate) fn nanoseconds(self) -> NoUnits128 {
+    pub(crate) fn duration(self) -> SignedDuration {
         match self {
-            Unit::Nanosecond => Constant(1),
-            Unit::Microsecond => t::NANOS_PER_MICRO,
-            Unit::Millisecond => t::NANOS_PER_MILLI,
-            Unit::Second => t::NANOS_PER_SECOND,
-            Unit::Minute => t::NANOS_PER_MINUTE,
-            Unit::Hour => t::NANOS_PER_HOUR,
-            Unit::Day => t::NANOS_PER_CIVIL_DAY,
-            Unit::Week => t::NANOS_PER_CIVIL_WEEK,
+            Unit::Nanosecond => SignedDuration::from_nanos(1),
+            Unit::Microsecond => SignedDuration::from_micros(1),
+            Unit::Millisecond => SignedDuration::from_millis(1),
+            Unit::Second => SignedDuration::from_secs(1),
+            Unit::Minute => SignedDuration::from_mins32(1),
+            Unit::Hour => SignedDuration::from_hours32(1),
+            Unit::Day => SignedDuration::from_civil_days32(1),
+            Unit::Week => SignedDuration::from_civil_weeks32(1),
             unit => unreachable!("{unit:?} has no definitive time interval"),
         }
-        .rinto()
     }
 
     /// Returns true when this unit is definitively variable.
@@ -4245,6 +3980,13 @@ impl Unit {
         }
     }
 
+    /// Return this unit as a `usize`.
+    ///
+    /// This is use `unit as usize`.
+    pub(crate) fn as_usize(&self) -> usize {
+        *self as usize
+    }
+
     /// The inverse of `unit as usize`.
     fn from_usize(n: usize) -> Option<Unit> {
         match n {
@@ -4259,6 +4001,25 @@ impl Unit {
             8 => Some(Unit::Month),
             9 => Some(Unit::Year),
             _ => None,
+        }
+    }
+
+    /// Returns an error corresponding the boundaries of this unit.
+    ///
+    /// This is useful in contexts where one is doing arithmetic on integers
+    /// where the units of those integers aren't known statically.
+    fn error(self) -> b::BoundsError {
+        match self {
+            Unit::Year => b::SpanYears::error(),
+            Unit::Month => b::SpanMonths::error(),
+            Unit::Week => b::SpanWeeks::error(),
+            Unit::Day => b::SpanDays::error(),
+            Unit::Hour => b::SpanHours::error(),
+            Unit::Minute => b::SpanMinutes::error(),
+            Unit::Second => b::SpanSeconds::error(),
+            Unit::Millisecond => b::SpanMilliseconds::error(),
+            Unit::Microsecond => b::SpanMicroseconds::error(),
+            Unit::Nanosecond => b::SpanNanoseconds::error(),
         }
     }
 }
@@ -4336,7 +4097,7 @@ impl<'a> SpanArithmetic<'a> {
     ///     span1.checked_add(span2).unwrap_err().to_string(),
     ///     "using unit 'day' in a span or configuration requires that \
     ///      either a relative reference time be given or \
-    ///      `SpanRelativeTo::days_are_24_hours()` is used to indicate \
+    ///      `jiff::SpanRelativeTo::days_are_24_hours()` is used to indicate \
     ///      invariant 24-hour days, but neither were provided",
     /// );
     /// let sum = span1.checked_add(
@@ -4566,7 +4327,7 @@ impl<'a> SpanCompare<'a> {
     /// required. Otherwise, you get an error.
     ///
     /// ```
-    /// use jiff::{SpanCompare, ToSpan, Unit};
+    /// use jiff::{SpanCompare, ToSpan};
     ///
     /// let span1 = 2.days().hours(12);
     /// let span2 = 60.hours();
@@ -4575,7 +4336,7 @@ impl<'a> SpanCompare<'a> {
     ///     span1.compare(span2).unwrap_err().to_string(),
     ///     "using unit 'day' in a span or configuration requires that \
     ///      either a relative reference time be given or \
-    ///      `SpanRelativeTo::days_are_24_hours()` is used to indicate \
+    ///      `jiff::SpanRelativeTo::days_are_24_hours()` is used to indicate \
     ///      invariant 24-hour days, but neither were provided",
     /// );
     /// let ordering = span1.compare(
@@ -4612,20 +4373,20 @@ impl<'a> SpanCompare<'a> {
             Some(r) => match r.to_relative(unit)? {
                 Some(r) => r,
                 None => {
-                    let nanos1 = span1.to_invariant_nanoseconds();
-                    let nanos2 = span2.to_invariant_nanoseconds();
-                    return Ok(nanos1.cmp(&nanos2));
+                    let dur1 = span1.to_invariant_duration();
+                    let dur2 = span2.to_invariant_duration();
+                    return Ok(dur1.cmp(&dur2));
                 }
             },
             None => {
                 requires_relative_date_err(unit)?;
-                let nanos1 = span1.to_invariant_nanoseconds();
-                let nanos2 = span2.to_invariant_nanoseconds();
-                return Ok(nanos1.cmp(&nanos2));
+                let dur1 = span1.to_invariant_duration();
+                let dur2 = span2.to_invariant_duration();
+                return Ok(dur1.cmp(&dur2));
             }
         };
-        let end1 = start.checked_add(span1)?.to_nanosecond();
-        let end2 = start.checked_add(span2)?.to_nanosecond();
+        let end1 = start.checked_add(span1)?.to_duration();
+        let end2 = start.checked_add(span2)?.to_duration();
         Ok(end1.cmp(&end2))
     }
 }
@@ -4806,7 +4567,7 @@ impl<'a> SpanTotal<'a> {
     ///     span.total(Unit::Hour).unwrap_err().to_string(),
     ///     "using unit 'day' in a span or configuration requires that either \
     ///      a relative reference time be given or \
-    ///      `SpanRelativeTo::days_are_24_hours()` is used to indicate \
+    ///      `jiff::SpanRelativeTo::days_are_24_hours()` is used to indicate \
     ///      invariant 24-hour days, but neither were provided",
     /// );
     ///
@@ -4862,7 +4623,7 @@ impl<'a> SpanTotal<'a> {
         }
 
         assert!(self.unit >= Unit::Day);
-        let sign = relspan.span.get_sign_ranged();
+        let sign = relspan.span.get_sign();
         let (relative_start, relative_end) = match relspan.kind {
             RelativeSpanKind::Civil { start, end } => {
                 let start = Relative::Civil(start);
@@ -4875,23 +4636,28 @@ impl<'a> SpanTotal<'a> {
                 (start, end)
             }
         };
-        let (relative0, relative1) = clamp_relative_span(
+        let (relative0, relative1) = unit_start_and_end(
             &relative_start,
             relspan.span.without_lower(self.unit),
             self.unit,
-            sign.rinto(),
+            sign.as_i64(),
         )?;
-        let denom = (relative1 - relative0).get() as f64;
-        let numer = (relative_end.to_nanosecond() - relative0).get() as f64;
-        let unit_val = relspan.span.get_units_ranged(self.unit).get() as f64;
-        Ok(unit_val + (numer / denom) * (sign.get() as f64))
+        let denom = (relative1 - relative0).as_nanos() as f64;
+        let numer = (relative_end.to_duration() - relative0).as_nanos() as f64;
+        let unit_val = relspan.span.get_unit(self.unit) as f64;
+        Ok(unit_val + (numer / denom) * (sign.as_i8() as f64))
     }
 
     #[inline]
     fn total_invariant(&self, span: Span) -> f64 {
         assert!(self.unit <= Unit::Week);
-        let nanos = span.to_invariant_nanoseconds();
-        (nanos.get() as f64) / (self.unit.nanoseconds().get() as f64)
+        let dur = span.to_invariant_duration().as_nanos();
+        // We do this instead of using `SignedDuration::as_secs_f64()`
+        // because of floating point precision. It seems that if we represent
+        // our ratio as floats of seconds instead of nanoseconds, then there
+        // is more loss of precision than using nanoseconds. Unfortunately,
+        // this does mean manifesting `i128` values.
+        (dur as f64) / (self.unit.duration().as_nanos() as f64)
     }
 }
 
@@ -5203,6 +4969,9 @@ impl<'a> SpanRound<'a> {
     /// Namely, any integer that divides evenly into `1,000` nanoseconds since
     /// there are `1,000` nanoseconds in the next highest unit (microseconds).
     ///
+    /// In all cases, the increment must be greater than zero and less than
+    /// or equal to `1_000_000_000`.
+    ///
     /// The error will occur when computing the span, and not when setting
     /// the increment here.
     ///
@@ -5314,8 +5083,9 @@ impl<'a> SpanRound<'a> {
     ///     span.round(Unit::Day).unwrap_err().to_string(),
     ///     "error with `smallest` rounding option: using unit 'day' in a \
     ///      span or configuration requires that either a relative reference \
-    ///      time be given or `SpanRelativeTo::days_are_24_hours()` is used \
-    ///      to indicate invariant 24-hour days, but neither were provided",
+    ///      time be given or `jiff::SpanRelativeTo::days_are_24_hours()` is \
+    ///      used to indicate invariant 24-hour days, but neither were \
+    ///      provided",
     /// );
     /// let rounded = span.round(
     ///     SpanRound::new().smallest(Unit::Day).days_are_24_hours(),
@@ -5354,27 +5124,36 @@ impl<'a> SpanRound<'a> {
     /// could result in rounding making a change. (And indeed, in the general
     /// case of span rounding below, we do a more involved check for this.)
     #[inline]
-    pub(crate) fn rounding_may_change_span_ignore_largest(&self) -> bool {
-        self.smallest > Unit::Nanosecond || self.increment > 1
+    pub(crate) fn rounding_may_change_span(&self) -> bool {
+        self.smallest > Unit::Nanosecond || self.increment != 1
+    }
+
+    /// Like `SpanRound::rounding_may_change_span`, but applies to contexts
+    /// where only calendar units are applicable.
+    ///
+    /// At time of writing (2026-02-05), this is only used for `civil::Date`.
+    #[inline]
+    pub(crate) fn rounding_calendar_only_may_change_span(&self) -> bool {
+        self.smallest > Unit::Day || self.increment != 1
     }
 
     /// Does the actual span rounding.
     fn round(&self, span: Span) -> Result<Span, Error> {
         let existing_largest = span.largest_unit();
-        let mode = self.mode;
-        let smallest = self.smallest;
-        let largest =
-            self.largest.unwrap_or_else(|| smallest.max(existing_largest));
+        let largest = self
+            .largest
+            .unwrap_or_else(|| self.smallest.max(existing_largest));
         let max = existing_largest.max(largest);
-        let increment = increment::for_span(smallest, self.increment)?;
-        if largest < smallest {
-            return Err(err!(
-                "largest unit ('{largest}') cannot be smaller than \
-                 smallest unit ('{smallest}')",
-                largest = largest.singular(),
-                smallest = smallest.singular(),
+        let increment = Increment::for_span(self.smallest, self.increment)?;
+        if largest < self.smallest {
+            return Err(Error::from(
+                UnitConfigError::LargestSmallerThanSmallest {
+                    smallest: self.smallest,
+                    largest,
+                },
             ));
         }
+
         let relative = match self.relative {
             Some(ref r) => {
                 match r.to_relative(max)? {
@@ -5387,32 +5166,32 @@ impl<'a> SpanRound<'a> {
                         // rounding is a simple matter of converting the span
                         // to a number of nanoseconds and then rounding that.
                         return Ok(round_span_invariant(
-                            span, smallest, largest, increment, mode,
+                            span, largest, &increment, self.mode,
                         )?);
                     }
                 }
             }
             None => {
-                // This is only okay if none of our units are above 'day'.
-                // That is, a reference point is only necessary when there is
-                // no reasonable invariant interpretation of the span. And this
-                // is only true when everything is less than 'day'.
-                requires_relative_date_err(smallest)
-                    .context("error with `smallest` rounding option")?;
+                // This is only okay if none of our units are above 'hour'.
+                // A `Span` can still be rounded without a relative datetime
+                // when it has weeks/days units, but that requires explicitly
+                // specifying a special relative date marker, which is handled
+                // by the `Some` case above.
+                requires_relative_date_err(self.smallest)
+                    .context(E::OptionSmallest)?;
                 if let Some(largest) = self.largest {
                     requires_relative_date_err(largest)
-                        .context("error with `largest` rounding option")?;
+                        .context(E::OptionLargest)?;
                 }
-                requires_relative_date_err(existing_largest).context(
-                    "error with largest unit in span to be rounded",
-                )?;
+                requires_relative_date_err(existing_largest)
+                    .context(E::OptionLargestInSpan)?;
                 assert!(max <= Unit::Week);
                 return Ok(round_span_invariant(
-                    span, smallest, largest, increment, mode,
+                    span, largest, &increment, self.mode,
                 )?);
             }
         };
-        relative.round(span, smallest, largest, increment, mode)
+        relative.round(span, largest, &increment, self.mode)
     }
 }
 
@@ -5446,11 +5225,11 @@ impl From<(Unit, i64)> for SpanRound<'static> {
 /// `2024-04-01` is 30 days. Similar for years.
 ///
 /// When a relative datetime in time zone aware (i.e., it is a `Zoned`), then
-/// a `Span` will also consider its day units to be variable in length. For
-/// example, `2024-03-10` in `America/New_York` was only 23 hours long, where
-/// as `2024-11-03` in `America/New_York` was 25 hours long. When a relative
-/// datetime is civil, then days are considered to always be of a fixed 24
-/// hour length.
+/// operations on a `Span` will also consider its day units to be variable in
+/// length. For example, `2024-03-10` in `America/New_York` was only 23 hours
+/// long, where as `2024-11-03` in `America/New_York` was 25 hours long. When
+/// a relative datetime is civil, then days are considered to always be of a
+/// fixed 24 hour length.
 ///
 /// This type is principally used as an input to one of several different
 /// [`Span`] APIs:
@@ -5461,7 +5240,7 @@ impl From<(Unit, i64)> for SpanRound<'static> {
 /// * Span arithmetic via [`Span::checked_add`] and [`Span::checked_sub`].
 /// A relative datetime is needed when adding or subtracting spans with
 /// calendar units.
-/// * Span comarisons via [`Span::compare`] require a relative datetime when
+/// * Span comparisons via [`Span::compare`] require a relative datetime when
 /// comparing spans with calendar units.
 /// * Computing the "total" duration as a single floating point number via
 /// [`Span::total`] also requires a relative datetime when dealing with
@@ -5522,7 +5301,7 @@ impl<'a> SpanRelativeTo<'a> {
     /// `Span` APIs. Previously, some APIs (like [`Timestamp::checked_add`])
     /// would always return an error if the `Span` given had non-zero
     /// units of days or greater. On the other hand, other APIs (like
-    /// [`Span::checked_add`]) would autoamtically assume days were always
+    /// [`Span::checked_add`]) would automatically assume days were always
     /// 24 hours if no relative reference time was given and either span had
     /// non-zero units of days. With this marker, APIs _never_ assume days are
     /// always 24 hours automatically.
@@ -5555,7 +5334,7 @@ impl<'a> SpanRelativeTo<'a> {
     ///     span.total(Unit::Hour).unwrap_err().to_string(),
     ///     "using unit 'day' in a span or configuration requires that either \
     ///      a relative reference time be given or \
-    ///      `SpanRelativeTo::days_are_24_hours()` is used to indicate \
+    ///      `jiff::SpanRelativeTo::days_are_24_hours()` is used to indicate \
     ///      invariant 24-hour days, but neither were provided",
     /// );
     /// // Opt into invariant 24 hour days without a relative date:
@@ -5591,7 +5370,7 @@ impl<'a> SpanRelativeTo<'a> {
     ///     span.total(Unit::Hour).unwrap_err().to_string(),
     ///     "using unit 'week' in a span or configuration requires that either \
     ///      a relative reference time be given or \
-    ///      `SpanRelativeTo::days_are_24_hours()` is used to indicate \
+    ///      `jiff::SpanRelativeTo::days_are_24_hours()` is used to indicate \
     ///      invariant 24-hour days, but neither were provided",
     /// );
     /// // Opt into invariant 24 hour days without a relative date:
@@ -5664,6 +5443,10 @@ impl<'a> SpanRelativeTo<'a> {
     /// Converts this public API relative datetime into a more versatile
     /// internal representation of the same concept.
     ///
+    /// The unit given should be the maximal non-zero unit present in the
+    /// operation. (Which might involve two spans, in which case, it is the
+    /// maximal non-zero unit across both spans.)
+    ///
     /// Basically, the internal `Relative` type is `Cow` which means it isn't
     /// `Copy`. But it can present a more uniform API. The public API type
     /// doesn't have `Cow` so that it can be `Copy`.
@@ -5675,6 +5458,10 @@ impl<'a> SpanRelativeTo<'a> {
     /// datetime but a "marker" indicating some unit (like days) should be
     /// treated as invariant. Or `None` is returned when the given unit is
     /// always invariant (hours or smaller).
+    ///
+    /// In effect, given that `unit` is the maximal unit involved, `None` is
+    /// returned when it's safe to assume that all units in the spans can be
+    /// interpreted as invariant (even if they can sometimes be varying).
     ///
     /// # Errors
     ///
@@ -5696,13 +5483,10 @@ impl<'a> SpanRelativeTo<'a> {
             }
             SpanRelativeToKind::DaysAre24Hours => {
                 if matches!(unit, Unit::Year | Unit::Month) {
-                    return Err(err!(
-                        "using unit '{unit}' in span or configuration \
-                         requires that a relative reference time be given \
-                         (`SpanRelativeTo::days_are_24_hours()` was given \
-                         but this only permits using days and weeks \
-                         without a relative reference time)",
-                        unit = unit.singular(),
+                    return Err(Error::from(
+                        UnitConfigError::RelativeYearOrMonthGivenDaysAre24Hours {
+                            unit,
+                        },
                     ));
                 }
                 Ok(None)
@@ -5746,13 +5530,13 @@ impl From<Date> for SpanRelativeTo<'static> {
 /// arbitrary `Span` is pretty involved. But if you know the `Span` only
 /// consists of non-zero units of days (and zero for all other units), then you
 /// can take a much cheaper path.
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, Default)]
 pub(crate) struct UnitSet(u16);
 
 impl UnitSet {
     /// Return a bit set representing all units as zero.
     #[inline]
-    fn empty() -> UnitSet {
+    const fn empty() -> UnitSet {
         UnitSet(0)
     }
 
@@ -5761,7 +5545,7 @@ impl UnitSet {
     /// When `is_zero` is false, the unit is added to this set. Otherwise,
     /// the unit is removed from this set.
     #[inline]
-    fn set(self, unit: Unit, is_zero: bool) -> UnitSet {
+    const fn set(self, unit: Unit, is_zero: bool) -> UnitSet {
         let bit = 1 << unit as usize;
         if is_zero {
             UnitSet(self.0 & !bit)
@@ -5770,10 +5554,29 @@ impl UnitSet {
         }
     }
 
+    /// Returns the set constructed from the given slice of units.
+    #[inline]
+    pub(crate) const fn from_slice(units: &[Unit]) -> UnitSet {
+        let mut set = UnitSet::empty();
+        let mut i = 0;
+        while i < units.len() {
+            set = set.set(units[i], false);
+            i += 1;
+        }
+        set
+    }
+
     /// Returns true if and only if no units are in this set.
     #[inline]
     pub(crate) fn is_empty(&self) -> bool {
         self.0 == 0
+    }
+
+    /// Returns true when this `Span` contains a non-zero value for the given
+    /// unit.
+    #[inline]
+    pub(crate) fn contains(self, unit: Unit) -> bool {
+        (self.0 & (1 << unit as usize)) != 0
     }
 
     /// Returns true if and only if this `Span` contains precisely one
@@ -5793,6 +5596,12 @@ impl UnitSet {
     #[inline]
     pub(crate) fn only_time(self) -> UnitSet {
         UnitSet(self.0 & 0b0000_0000_0011_1111)
+    }
+
+    /// Returns the intersection of this set and the one given.
+    #[inline]
+    pub(crate) fn intersection(self, other: UnitSet) -> UnitSet {
+        UnitSet(self.0 & other.0)
     }
 
     /// Returns the largest unit in this set, or `None` if none are present.
@@ -5883,7 +5692,7 @@ impl<'a> Relative<'a> {
     /// This returns an error in the same cases as the underlying checked
     /// arithmetic APIs. In general, this occurs when adding the given `span`
     /// would result in overflow.
-    fn checked_add(&self, span: Span) -> Result<Relative, Error> {
+    fn checked_add(&'a self, span: Span) -> Result<Relative<'a>, Error> {
         match *self {
             Relative::Civil(dt) => Ok(Relative::Civil(dt.checked_add(span)?)),
             Relative::Zoned(ref zdt) => {
@@ -5893,9 +5702,9 @@ impl<'a> Relative<'a> {
     }
 
     fn checked_add_duration(
-        &self,
+        &'a self,
         duration: SignedDuration,
-    ) -> Result<Relative, Error> {
+    ) -> Result<Relative<'a>, Error> {
         match *self {
             Relative::Civil(dt) => {
                 Ok(Relative::Civil(dt.checked_add_duration(duration)?))
@@ -5945,12 +5754,10 @@ impl<'a> Relative<'a> {
     /// If there was a problem doing this conversion, then an error is
     /// returned. In practice, this only occurs for a civil datetime near the
     /// civil datetime minimum and maximum values.
-    fn to_nanosecond(&self) -> NoUnits128 {
+    fn to_duration(&self) -> SignedDuration {
         match *self {
-            Relative::Civil(dt) => dt.timestamp.as_nanosecond_ranged().rinto(),
-            Relative::Zoned(ref zdt) => {
-                zdt.zoned.timestamp().as_nanosecond_ranged().rinto()
-            }
+            Relative::Civil(dt) => dt.timestamp.as_duration(),
+            Relative::Zoned(ref zdt) => zdt.zoned.timestamp().as_duration(),
         }
     }
 
@@ -5986,9 +5793,9 @@ impl<'a> Relative<'a> {
             }
         };
         let relspan = kind.into_relative_span(largest)?;
-        if span.get_sign_ranged() != C(0)
-            && relspan.span.get_sign_ranged() != C(0)
-            && span.get_sign_ranged() != relspan.span.get_sign_ranged()
+        if !span.get_sign().is_zero()
+            && !relspan.span.get_sign().is_zero()
+            && span.get_sign() != relspan.span.get_sign()
         {
             // I haven't quite figured out when this case is hit. I think it's
             // actually impossible right? Balancing a duration should not flip
@@ -6006,32 +5813,28 @@ impl<'a> Relative<'a> {
     fn round(
         self,
         span: Span,
-        smallest: Unit,
         largest: Unit,
-        increment: NoUnits128,
+        increment: &Increment,
         mode: RoundMode,
     ) -> Result<Span, Error> {
         let relspan = self.into_relative_span(largest, span)?;
-        if relspan.span.get_sign_ranged() == C(0) {
+        if relspan.span.get_sign().is_zero() {
             return Ok(relspan.span);
         }
         let nudge = match relspan.kind {
             RelativeSpanKind::Civil { start, end } => {
-                if smallest > Unit::Day {
+                if increment.unit() > Unit::Day {
                     Nudge::relative_calendar(
                         relspan.span,
                         &Relative::Civil(start),
                         &Relative::Civil(end),
-                        smallest,
                         increment,
                         mode,
                     )?
                 } else {
-                    let relative_end = end.timestamp.as_nanosecond_ranged();
                     Nudge::relative_invariant(
                         relspan.span,
-                        relative_end.rinto(),
-                        smallest,
+                        end.timestamp.as_duration(),
                         largest,
                         increment,
                         mode,
@@ -6039,12 +5842,11 @@ impl<'a> Relative<'a> {
                 }
             }
             RelativeSpanKind::Zoned { ref start, ref end } => {
-                if smallest >= Unit::Day {
+                if increment.unit() >= Unit::Day {
                     Nudge::relative_calendar(
                         relspan.span,
                         &Relative::Zoned(start.borrowed()),
                         &Relative::Zoned(end.borrowed()),
-                        smallest,
                         increment,
                         mode,
                     )?
@@ -6054,18 +5856,14 @@ impl<'a> Relative<'a> {
                     Nudge::relative_zoned_time(
                         relspan.span,
                         start,
-                        smallest,
                         increment,
                         mode,
                     )?
                 } else {
                     // Otherwise, rounding is the same as civil datetime.
-                    let relative_end =
-                        end.zoned.timestamp().as_nanosecond_ranged();
                     Nudge::relative_invariant(
                         relspan.span,
-                        relative_end.rinto(),
-                        smallest,
+                        end.zoned.timestamp().as_duration(),
                         largest,
                         increment,
                         mode,
@@ -6073,7 +5871,7 @@ impl<'a> Relative<'a> {
                 }
             }
         };
-        nudge.bubble(&relspan, smallest, largest)
+        nudge.bubble(&relspan, increment.unit(), largest)
     }
 }
 
@@ -6111,27 +5909,12 @@ impl<'a> RelativeSpanKind<'a> {
             RelativeSpanKind::Civil { ref start, ref end } => start
                 .datetime
                 .until((largest, end.datetime))
-                .with_context(|| {
-                    err!(
-                        "failed to get span between {start} and {end} \
-                         with largest unit as {unit}",
-                        start = start.datetime,
-                        end = end.datetime,
-                        unit = largest.plural(),
-                    )
-                })?,
-            RelativeSpanKind::Zoned { ref start, ref end } => start
-                .zoned
-                .until((largest, &*end.zoned))
-                .with_context(|| {
-                    err!(
-                        "failed to get span between {start} and {end} \
-                         with largest unit as {unit}",
-                        start = start.zoned,
-                        end = end.zoned,
-                        unit = largest.plural(),
-                    )
-                })?,
+                .context(E::FailedSpanBetweenDateTimes { unit: largest })?,
+            RelativeSpanKind::Zoned { ref start, ref end } => {
+                start.zoned.until((largest, &*end.zoned)).context(
+                    E::FailedSpanBetweenZonedDateTimes { unit: largest },
+                )?
+            }
         };
         Ok(RelativeSpan { span, kind: self })
     }
@@ -6172,9 +5955,7 @@ impl RelativeCivil {
     fn new(datetime: DateTime) -> Result<RelativeCivil, Error> {
         let timestamp = datetime
             .to_zoned(TimeZone::UTC)
-            .with_context(|| {
-                err!("failed to convert {datetime} to timestamp")
-            })?
+            .context(E::ConvertDateTimeToTimestamp)?
             .timestamp();
         Ok(RelativeCivil { datetime, timestamp })
     }
@@ -6190,14 +5971,10 @@ impl RelativeCivil {
     /// converted to a timestamp in UTC. This only occurs near the minimum and
     /// maximum datetime values.
     fn checked_add(&self, span: Span) -> Result<RelativeCivil, Error> {
-        let datetime = self.datetime.checked_add(span).with_context(|| {
-            err!("failed to add {span} to {dt}", dt = self.datetime)
-        })?;
+        let datetime = self.datetime.checked_add(span)?;
         let timestamp = datetime
             .to_zoned(TimeZone::UTC)
-            .with_context(|| {
-                err!("failed to convert {datetime} to timestamp")
-            })?
+            .context(E::ConvertDateTimeToTimestamp)?
             .timestamp();
         Ok(RelativeCivil { datetime, timestamp })
     }
@@ -6217,15 +5994,10 @@ impl RelativeCivil {
         &self,
         duration: SignedDuration,
     ) -> Result<RelativeCivil, Error> {
-        let datetime =
-            self.datetime.checked_add(duration).with_context(|| {
-                err!("failed to add {duration:?} to {dt}", dt = self.datetime)
-            })?;
+        let datetime = self.datetime.checked_add(duration)?;
         let timestamp = datetime
             .to_zoned(TimeZone::UTC)
-            .with_context(|| {
-                err!("failed to convert {datetime} to timestamp")
-            })?
+            .context(E::ConvertDateTimeToTimestamp)?
             .timestamp();
         Ok(RelativeCivil { datetime, timestamp })
     }
@@ -6243,15 +6015,9 @@ impl RelativeCivil {
         largest: Unit,
         other: &RelativeCivil,
     ) -> Result<Span, Error> {
-        self.datetime.until((largest, other.datetime)).with_context(|| {
-            err!(
-                "failed to get span between {dt1} and {dt2} \
-                 with largest unit as {unit}",
-                unit = largest.plural(),
-                dt1 = self.datetime,
-                dt2 = other.datetime,
-            )
-        })
+        self.datetime
+            .until((largest, other.datetime))
+            .context(E::FailedSpanBetweenDateTimes { unit: largest })
     }
 }
 
@@ -6272,9 +6038,7 @@ impl<'a> RelativeZoned<'a> {
         &self,
         span: Span,
     ) -> Result<RelativeZoned<'static>, Error> {
-        let zoned = self.zoned.checked_add(span).with_context(|| {
-            err!("failed to add {span} to {zoned}", zoned = self.zoned)
-        })?;
+        let zoned = self.zoned.checked_add(span)?;
         Ok(RelativeZoned { zoned: DumbCow::Owned(zoned) })
     }
 
@@ -6288,9 +6052,7 @@ impl<'a> RelativeZoned<'a> {
         &self,
         duration: SignedDuration,
     ) -> Result<RelativeZoned<'static>, Error> {
-        let zoned = self.zoned.checked_add(duration).with_context(|| {
-            err!("failed to add {duration:?} to {zoned}", zoned = self.zoned)
-        })?;
+        let zoned = self.zoned.checked_add(duration)?;
         Ok(RelativeZoned { zoned: DumbCow::Owned(zoned) })
     }
 
@@ -6307,20 +6069,14 @@ impl<'a> RelativeZoned<'a> {
         largest: Unit,
         other: &RelativeZoned<'a>,
     ) -> Result<Span, Error> {
-        self.zoned.until((largest, &*other.zoned)).with_context(|| {
-            err!(
-                "failed to get span between {zdt1} and {zdt2} \
-                 with largest unit as {unit}",
-                unit = largest.plural(),
-                zdt1 = self.zoned,
-                zdt2 = other.zoned,
-            )
-        })
+        self.zoned
+            .until((largest, &*other.zoned))
+            .context(E::FailedSpanBetweenZonedDateTimes { unit: largest })
     }
 
     /// Returns the borrowed version of self; useful when you need to convert
     /// `&RelativeZoned` into `RelativeZoned` without cloning anything.
-    fn borrowed(&self) -> RelativeZoned {
+    fn borrowed(&'a self) -> RelativeZoned<'a> {
         RelativeZoned { zoned: self.zoned.borrowed() }
     }
 }
@@ -6357,7 +6113,7 @@ struct Nudge {
     span: Span,
     /// The nanosecond timestamp corresponding to `relative + span`, where
     /// `span` is the (possibly bottom heavy) rounded span.
-    rounded_relative_end: NoUnits128,
+    rounded_relative_end: SignedDuration,
     /// Whether rounding may have created a bottom heavy span such that a
     /// calendar unit might need to be incremented after re-balancing smaller
     /// units.
@@ -6377,38 +6133,32 @@ impl Nudge {
     /// nanoseconds, rounding it and then converting back to a span.
     fn relative_invariant(
         balanced: Span,
-        relative_end: NoUnits128,
-        smallest: Unit,
+        relative_end: SignedDuration,
         largest: Unit,
-        increment: NoUnits128,
+        increment: &Increment,
         mode: RoundMode,
     ) -> Result<Nudge, Error> {
         // Ensures this is only called when rounding invariant units.
-        assert!(smallest <= Unit::Week);
+        // Technically, it would be fine to allow weeks here, but this
+        // code doesn't handle the special case of smallest==Week because
+        // it just didn't account for it originally. But it probably should.
+        // Then we could use this routine for rounding civil datetimes when
+        // smallest==Week.
+        assert!(increment.unit() <= Unit::Day);
 
-        let sign = balanced.get_sign_ranged();
-        let balanced_nanos = balanced.to_invariant_nanoseconds();
-        let rounded_nanos = mode.round_by_unit_in_nanoseconds(
-            balanced_nanos,
-            smallest,
-            increment,
-        );
-        let span = Span::from_invariant_nanoseconds(largest, rounded_nanos)
-            .with_context(|| {
-                err!(
-                    "failed to convert rounded nanoseconds {rounded_nanos} \
-                     to span for largest unit as {unit}",
-                    unit = largest.plural(),
-                )
-            })?
-            .years_ranged(balanced.get_years_ranged())
-            .months_ranged(balanced.get_months_ranged())
-            .weeks_ranged(balanced.get_weeks_ranged());
+        let sign = balanced.get_sign();
+        let balanced_nanos = balanced.to_invariant_duration();
+        let rounded_nanos = increment.round(mode, balanced_nanos)?;
+        let span = Span::from_invariant_duration(largest, rounded_nanos)
+            .context(E::ConvertNanoseconds { unit: largest })?
+            .years(balanced.get_years())
+            .months(balanced.get_months())
+            .weeks(balanced.get_weeks());
 
         let diff_nanos = rounded_nanos - balanced_nanos;
-        let diff_days = rounded_nanos.div_ceil(t::NANOS_PER_CIVIL_DAY)
-            - balanced_nanos.div_ceil(t::NANOS_PER_CIVIL_DAY);
-        let grew_big_unit = diff_days.signum() == sign;
+        let diff_days =
+            rounded_nanos.as_civil_days() - balanced_nanos.as_civil_days();
+        let grew_big_unit = b::Sign::from(diff_days) == sign;
         let rounded_relative_end = relative_end + diff_nanos;
         Ok(Nudge { span, rounded_relative_end, grew_big_unit })
     }
@@ -6420,54 +6170,142 @@ impl Nudge {
         balanced: Span,
         relative_start: &Relative<'_>,
         relative_end: &Relative<'_>,
-        smallest: Unit,
-        increment: NoUnits128,
+        increment: &Increment,
         mode: RoundMode,
     ) -> Result<Nudge, Error> {
-        #[cfg(not(feature = "std"))]
-        use crate::util::libm::Float;
+        // This implementation is quite tricky and subtle. It is loosely based
+        // on the fullcalendar polyfill for Temporal:
+        // repo: https://github.com/fullcalendar/temporal-polyfill/
+        // commit: bc1baf3875392ecd8522d40e7eecb55fa582808c
+        // file: packages/temporal-polyfill/src/internal/round.ts
+        // lines: L647-L711
+        //
+        // This diverges from the fullcalendar polyfill, however, by avoiding
+        // the use of floating point. In part because almost all of Jiff avoids
+        // floats (two exceptions being `Span::total` and
+        // `SignedDuration::try_from_secs_{f32,f64}`). We used to use floats
+        // here, and it drove be nuts because it was impossible to avoid in
+        // this code path. And it also required duplicating our rounding code
+        // just to handle this case.
+        //
+        // In any case, I stared at this code and fullcalendar's implementation
+        // for quite some time, and I believe converted it over to sticking
+        // with just integers. The key insight is moving everything to
+        // nanoseconds and rounding there. I'm not quite sure why fullcalendar
+        // doesn't do it this way. I think they are more tightly coupled with
+        // Javascript's `number`, and so avoiding floats probably isn't a
+        // priority?
+        //
+        // OK, so how does this work? The basic idea here is that, e.g., we
+        // don't know long "1 month" or "1 year" is. (Or "1 day" in the case of
+        // a zoned datetime.) So how do we know whether to e.g., round "1 month
+        // 15 days" up to "2 month" or down to "1 month"? (For the `HalfExpand`
+        // rounding mode.) So for this case, we need to compute what "1 month"
+        // actually means in the context of our relative datetime (which we
+        // must have if we're calling this routine). This is done by doing
+        // some span arithemtic to calculate the length of time for one
+        // increment's worth of the units we are rounding to.
+        //
+        // This approach is overall very similar to the approach we used for
+        // rounding zoned datetimes. (Because the length of a day may vary.)
 
-        assert!(smallest >= Unit::Day);
-        let sign = balanced.get_sign_ranged();
-        let truncated = increment
-            * balanced.get_units_ranged(smallest).div_ceil(increment);
-        let span = balanced
-            .without_lower(smallest)
-            .try_units_ranged(smallest, truncated.rinto())
-            .with_context(|| {
-                err!(
-                    "failed to set {unit} to {truncated} on span {balanced}",
-                    unit = smallest.singular()
-                )
-            })?;
-        let (relative0, relative1) = clamp_relative_span(
-            relative_start,
-            span,
-            smallest,
-            NoUnits::try_rfrom("increment", increment)?
-                .try_checked_mul("signed increment", sign)?,
-        )?;
+        // This bit is actually pretty important context: this code *only*
+        // covers the case when the user asks for a smallest unit that is a
+        // calendar unit. That means that the rounding we're doing is for a
+        // unit that is potentially of varying length. If our relative datetime
+        // is civil, then weeks/days won't be varying length, but the code
+        // below still handles it. (Although this code won't be used when we
+        // have a relative civil datetime and request a smallest unit of days.
+        // That's because we can fall back to code assuming that days are an
+        // invariant unit.)
+        assert!(increment.unit() >= Unit::Day);
 
-        // FIXME: This is brutal. This is the only non-optional floating point
-        // used so far in Jiff. We do expose floating point for things like
-        // `Span::total`, but that's optional and not a core part of Jiff's
-        // functionality. This is in the core part of Jiff's span rounding...
-        let denom = (relative1 - relative0).get() as f64;
-        let numer = (relative_end.to_nanosecond() - relative0).get() as f64;
-        let exact = (truncated.get() as f64)
-            + (numer / denom) * (sign.get() as f64) * (increment.get() as f64);
-        let rounded = mode.round_float(exact, increment);
+        let increment_units = i64::from(increment.value());
+        let smallest = increment.unit();
+        let sign = balanced.get_sign();
+        // We want to measure the length of `increment`, which is done by
+        // adding spans to `relative_start` with just one unit adjusted. The
+        // `truncated` value is our starting point. The next will be
+        // `truncated + (sign * increment)`.
+        let truncated =
+            increment_units * (balanced.get_unit(smallest) / increment_units);
+        // Drop all units below smallest. We specifically don't want them and
+        // here is where we no longer need them. `relative_end` still captures
+        // how "close" we are between increments of `smallest`.
+        let span =
+            balanced.without_lower(smallest).try_unit(smallest, truncated)?;
+        // This is OK because the increment value is guaranteed to be in the
+        // range `1..=1_000_000_000`. Therefore, multiplying by {-1,0,1} is
+        // always valid.
+        //
+        // The "amount" refers to the length of time (in units of `smallest`)
+        // we want to measure. We don't actually know how long an `increment`
+        // is. So we "measure" is by adding (or subtracting, depending on the
+        // sign of the original span) to our relative datetime.
+        let amount = sign * increment_units;
+        // This is the "measurement" we mentioned above. We get back
+        // `relative_start + span` and `relative_start + span + extra`,
+        // where `extra` is `span` but with its `smallest` units set to
+        // `amount`. Thus, `relative1 - relative0` corresponds to the length
+        // in time, in nanoseconds, of `increment` units of `smallest`.
+        let (relative0, relative1) =
+            unit_start_and_end(relative_start, span, smallest, amount)?;
+
+        // This corresponds to how far our original span gets us to the next
+        // increment. That is, `relative_end = relative_start + original_span`.
+        // (We actually don't have `original_span` here, but that's how
+        // `relative_end` is computed. `balanced` is then computed from
+        // `relative_start.until((largest_unit, relative_end))`.
+        let progress_nanos = relative_end.to_duration() - relative0;
+        // This is the length of `increment` units of `smallest`, but in units
+        // of nanoseconds. The `.abs()` is OK because the difference in time,
+        // even in nanoseconds, between -9999-01-01 and 9999-12-31 will never
+        // be `SignedDuration::MIN`.
+        let increment_nanos = (relative1 - relative0).abs();
+        // Now we finally do the actual rounding: we round how much "progress"
+        // we've made toward `relative1` by rounding `progress_nanos` to the
+        // nearest increment value.
+        //
+        // The rounded nanoseconds returned can be greater than
+        // `increment_nanos` when `smallest==Unit::Week` and the *original*
+        // span had non-zero week units. This is because computing a balanced
+        // span eliminates the week units, and so it is expected that
+        // `relative_end` might be much bigger (or smaller, for negative spans)
+        // than `relative1`.
+        let rounded_nanos =
+            mode.round_by_duration(progress_nanos, increment_nanos)?;
+        // If we rounded up, then it's possible we might need to to re-balance
+        // our span. (This happens in `bubble`.)
         let grew_big_unit =
-            ((rounded.get() as f64) - exact).signum() == (sign.get() as f64);
-
-        let span = span
-            .try_units_ranged(smallest, rounded.rinto())
-            .with_context(|| {
-                err!(
-                    "failed to set {unit} to {truncated} on span {span}",
-                    unit = smallest.singular()
-                )
-            })?;
+            sign == b::Sign::from(rounded_nanos - progress_nanos);
+        // These asserts check an assumption that, since we're dealing with
+        // calendar units, and because time zone transitions never have
+        // precision less than 1 second, it follows that the *length* of
+        // the increment at nanosecond precision will never have non-zero
+        // sub-seconds. This also guarantees that the result of rounding will
+        // also never have non-zero sub-seconds (since the result of rounding
+        // has to be a multiple of the increment).
+        //
+        // This is an important assumption to check, because we drop the
+        // sub-second components on these durations in order to do division on
+        // them below via 64-bit integers. (Otherwise we'd have to use 128-bit
+        // integers.)
+        debug_assert_eq!(rounded_nanos.subsec_nanos(), 0);
+        debug_assert_eq!(increment_nanos.subsec_nanos(), 0);
+        // Now we need to get back to our original units. We started with
+        // `truncated`, so just add the number of units we covered via
+        // rounding. We must multiply by `increment` because `rounded /
+        // increment` gets us back the number of *increments* we rounded over.
+        // But the actual number of units may be bigger.
+        let span = span.try_unit(
+            smallest,
+            truncated
+                + (increment_units
+                    * (rounded_nanos.as_secs() / increment_nanos.as_secs())),
+        )?;
+        // If we rounded up, then the time we don't want to exceed is
+        // `relative1`. Otherwise, we don't want to exceed `relative0`.
+        // (This is used later in `bubble`.)
         let rounded_relative_end =
             if grew_big_unit { relative1 } else { relative0 };
         Ok(Nudge { span, rounded_relative_end, grew_big_unit })
@@ -6478,53 +6316,40 @@ impl Nudge {
     fn relative_zoned_time(
         balanced: Span,
         relative_start: &RelativeZoned<'_>,
-        smallest: Unit,
-        increment: NoUnits128,
+        increment: &Increment,
         mode: RoundMode,
     ) -> Result<Nudge, Error> {
-        let sign = balanced.get_sign_ranged();
-        let time_nanos =
-            balanced.only_lower(Unit::Day).to_invariant_nanoseconds();
-        let mut rounded_time_nanos =
-            mode.round_by_unit_in_nanoseconds(time_nanos, smallest, increment);
-        let (relative0, relative1) = clamp_relative_span(
-            // FIXME: Find a way to drop this clone.
-            &Relative::Zoned(relative_start.clone()),
+        let sign = balanced.get_sign();
+        let time_dur = balanced.only_lower(Unit::Day).to_invariant_duration();
+        let mut rounded_time_nanos = increment.round(mode, time_dur)?;
+        let (relative0, relative1) = unit_start_and_end(
+            &Relative::Zoned(relative_start.borrowed()),
             balanced.without_lower(Unit::Day),
             Unit::Day,
-            sign.rinto(),
+            sign.as_i64(),
         )?;
         let day_nanos = relative1 - relative0;
         let beyond_day_nanos = rounded_time_nanos - day_nanos;
 
-        let mut day_delta = NoUnits::N::<0>();
-        let rounded_relative_end =
-            if beyond_day_nanos == C(0) || beyond_day_nanos.signum() == sign {
-                day_delta += C(1);
-                rounded_time_nanos = mode.round_by_unit_in_nanoseconds(
-                    beyond_day_nanos,
-                    smallest,
-                    increment,
-                );
-                relative1 + rounded_time_nanos
-            } else {
-                relative0 + rounded_time_nanos
-            };
+        let mut day_delta = 0;
+        let rounded_relative_end = if beyond_day_nanos.is_zero()
+            || b::Sign::from(beyond_day_nanos) == sign
+        {
+            day_delta += 1;
+            rounded_time_nanos = increment.round(mode, beyond_day_nanos)?;
+            relative1 + rounded_time_nanos
+        } else {
+            relative0 + rounded_time_nanos
+        };
 
         let span =
-            Span::from_invariant_nanoseconds(Unit::Hour, rounded_time_nanos)
-                .with_context(|| {
-                    err!(
-                        "failed to convert rounded nanoseconds \
-                     {rounded_time_nanos} to span for largest unit as {unit}",
-                        unit = Unit::Hour.plural(),
-                    )
-                })?
-                .years_ranged(balanced.get_years_ranged())
-                .months_ranged(balanced.get_months_ranged())
-                .weeks_ranged(balanced.get_weeks_ranged())
-                .days_ranged(balanced.get_days_ranged() + day_delta);
-        let grew_big_unit = day_delta != C(0);
+            Span::from_invariant_duration(Unit::Hour, rounded_time_nanos)
+                .context(E::ConvertNanoseconds { unit: Unit::Hour })?
+                .years(balanced.get_years())
+                .months(balanced.get_months())
+                .weeks(balanced.get_weeks())
+                .days(balanced.get_days() + day_delta);
+        let grew_big_unit = day_delta != 0;
         Ok(Nudge { span, rounded_relative_end, grew_big_unit })
     }
 
@@ -6548,7 +6373,7 @@ impl Nudge {
 
         let smallest = smallest.max(Unit::Day);
         let mut balanced = self.span;
-        let sign = balanced.get_sign_ranged();
+        let sign = balanced.get_sign();
         let mut unit = smallest;
         while let Some(u) = unit.next() {
             unit = u;
@@ -6563,24 +6388,10 @@ impl Nudge {
 
             let span_start = balanced.without_lower(unit);
             let new_units = span_start
-                .get_units_ranged(unit)
-                .try_checked_add("bubble-units", sign)
-                .with_context(|| {
-                    err!(
-                        "failed to add sign {sign} to {unit} value {value}",
-                        unit = unit.plural(),
-                        value = span_start.get_units_ranged(unit),
-                    )
-                })?;
-            let span_end = span_start
-                .try_units_ranged(unit, new_units)
-                .with_context(|| {
-                    err!(
-                        "failed to set {unit} to value \
-                         {new_units} on span {span_start}",
-                        unit = unit.plural(),
-                    )
-                })?;
+                .get_unit(unit)
+                .checked_add(sign.as_i64())
+                .ok_or_else(|| unit.error())?;
+            let span_end = span_start.try_unit(unit, new_units)?;
             let threshold = match relative.kind {
                 RelativeSpanKind::Civil { ref start, .. } => {
                     start.checked_add(span_end)?.timestamp
@@ -6589,9 +6400,9 @@ impl Nudge {
                     start.checked_add(span_end)?.zoned.timestamp()
                 }
             };
-            let beyond =
-                self.rounded_relative_end - threshold.as_nanosecond_ranged();
-            if beyond == C(0) || beyond.signum() == sign {
+            // If we overshoot our expected endpoint, then bail.
+            let beyond = self.rounded_relative_end - threshold.as_duration();
+            if beyond.is_zero() || b::Sign::from(beyond) == sign {
                 balanced = span_end;
             } else {
                 break;
@@ -6605,32 +6416,25 @@ impl Nudge {
 ///
 /// This only applies when the max of the units in the span being rounded,
 /// the largest configured unit and the smallest configured unit are all
-/// invariant. That is, days or lower for spans without a relative datetime or
-/// a relative civil datetime, and hours or lower for spans with a relative
-/// zoned datetime.
+/// invariant. That is, hours or lower for spans without a relative datetime,
+/// or weeks or lower for spans with a `SpanRelativeTo::days_are_24_hours()`
+/// marker.
 ///
 /// All we do here is convert the span to an integer number of nanoseconds,
 /// round that and then convert back. There aren't any tricky corner cases to
 /// consider here.
 fn round_span_invariant(
     span: Span,
-    smallest: Unit,
     largest: Unit,
-    increment: NoUnits128,
+    increment: &Increment,
     mode: RoundMode,
 ) -> Result<Span, Error> {
-    assert!(smallest <= Unit::Week);
-    assert!(largest <= Unit::Week);
-    let nanos = span.to_invariant_nanoseconds();
-    let rounded =
-        mode.round_by_unit_in_nanoseconds(nanos, smallest, increment);
-    Span::from_invariant_nanoseconds(largest, rounded).with_context(|| {
-        err!(
-            "failed to convert rounded nanoseconds {rounded} \
-             to span for largest unit as {unit}",
-            unit = largest.plural(),
-        )
-    })
+    debug_assert!(increment.unit() <= Unit::Week);
+    debug_assert!(largest <= Unit::Week);
+    let dur = span.to_invariant_duration();
+    let rounded = increment.round(mode, dur)?;
+    Span::from_invariant_duration(largest, rounded)
+        .context(E::ConvertNanoseconds { unit: largest })
 }
 
 /// Returns the nanosecond timestamps of `relative + span` and `relative +
@@ -6648,32 +6452,26 @@ fn round_span_invariant(
 ///
 /// This returns an error if adding the units overflows, or if doing the span
 /// arithmetic on `relative` overflows.
-fn clamp_relative_span(
+fn unit_start_and_end(
     relative: &Relative<'_>,
     span: Span,
     unit: Unit,
-    amount: NoUnits,
-) -> Result<(NoUnits128, NoUnits128), Error> {
-    let amount = span
-        .get_units_ranged(unit)
-        .try_checked_add("clamp-units", amount)
-        .with_context(|| {
-            err!(
-                "failed to add {amount} to {unit} \
-                 value {value} on span {span}",
-                unit = unit.plural(),
-                value = span.get_units_ranged(unit),
-            )
-        })?;
-    let span_amount =
-        span.try_units_ranged(unit, amount).with_context(|| {
-            err!(
-                "failed to set {unit} unit to {amount} on span {span}",
-                unit = unit.plural(),
-            )
-        })?;
-    let relative0 = relative.checked_add(span)?.to_nanosecond();
-    let relative1 = relative.checked_add(span_amount)?.to_nanosecond();
+    amount: i64,
+) -> Result<(SignedDuration, SignedDuration), Error> {
+    let amount =
+        span.get_unit(unit).checked_add(amount).ok_or_else(|| unit.error())?;
+    let span_amount = span.try_unit(unit, amount)?;
+    let relative0 = relative.checked_add(span)?.to_duration();
+    let relative1 = relative.checked_add(span_amount)?.to_duration();
+    // This assertion gives better failure modes to what would otherwise be
+    // subtle errors downstream if the durations returned here were equivalent.
+    // It would imply that the physical time duration between them is zero,
+    // and thus adding two spans---where one is strictly bigger/smaller than
+    // the other---would produce identical timestamps.
+    assert_ne!(
+        relative0, relative1,
+        "adding different spans should produce different timestamps"
+    );
     Ok((relative0, relative1))
 }
 
@@ -6693,25 +6491,22 @@ fn clamp_relative_span(
 /// (We do the same thing for `SignedDuration`.)
 #[cfg_attr(feature = "perf-inline", inline(always))]
 fn parse_iso_or_friendly(bytes: &[u8]) -> Result<Span, Error> {
-    if bytes.is_empty() {
-        return Err(err!(
-            "an empty string is not a valid `Span`, \
-             expected either a ISO 8601 or Jiff's 'friendly' \
-             format",
+    let Some((&byte, tail)) = bytes.split_first() else {
+        return Err(crate::Error::from(
+            crate::error::fmt::Error::HybridDurationEmpty,
         ));
-    }
-    let mut first = bytes[0];
+    };
+    let mut first = byte;
+    // N.B. Unsigned durations don't support negative durations (of
+    // course), but we still check for it here so that we can defer to
+    // the dedicated parsers. They will provide their own error messages.
     if first == b'+' || first == b'-' {
-        if bytes.len() == 1 {
-            return Err(err!(
-                "found nothing after sign `{sign}`, \
-                 which is not a valid `Span`, \
-                 expected either a ISO 8601 or Jiff's 'friendly' \
-                 format",
-                sign = escape::Byte(first),
+        let Some(&byte) = tail.first() else {
+            return Err(crate::Error::from(
+                crate::error::fmt::Error::HybridDurationPrefix { sign: first },
             ));
-        }
-        first = bytes[1];
+        };
+        first = byte;
     }
     if first == b'P' || first == b'p' {
         temporal::DEFAULT_SPAN_PARSER.parse_span(bytes)
@@ -6722,23 +6517,11 @@ fn parse_iso_or_friendly(bytes: &[u8]) -> Result<Span, Error> {
 
 fn requires_relative_date_err(unit: Unit) -> Result<(), Error> {
     if unit.is_variable() {
-        return Err(if matches!(unit, Unit::Week | Unit::Day) {
-            err!(
-                "using unit '{unit}' in a span or configuration \
-                 requires that either a relative reference time be given \
-                 or `SpanRelativeTo::days_are_24_hours()` is used to \
-                 indicate invariant 24-hour days, \
-                 but neither were provided",
-                unit = unit.singular(),
-            )
+        return Err(Error::from(if matches!(unit, Unit::Week | Unit::Day) {
+            UnitConfigError::RelativeWeekOrDay { unit }
         } else {
-            err!(
-                "using unit '{unit}' in a span or configuration \
-                 requires that a relative reference time be given, \
-                 but none was provided",
-                unit = unit.singular(),
-            )
-        });
+            UnitConfigError::RelativeYearOrMonth { unit }
+        }));
     }
     Ok(())
 }
@@ -7086,18 +6869,18 @@ mod tests {
 
     #[test]
     fn span_sign() {
-        assert_eq!(Span::new().get_sign_ranged(), C(0));
-        assert_eq!(Span::new().days(1).get_sign_ranged(), C(1));
-        assert_eq!(Span::new().days(-1).get_sign_ranged(), C(-1));
-        assert_eq!(Span::new().days(1).days(0).get_sign_ranged(), C(0));
-        assert_eq!(Span::new().days(-1).days(0).get_sign_ranged(), C(0));
+        assert_eq!(Span::new().get_sign(), b::Sign::Zero);
+        assert_eq!(Span::new().days(1).get_sign(), b::Sign::Positive);
+        assert_eq!(Span::new().days(-1).get_sign(), b::Sign::Negative);
+        assert_eq!(Span::new().days(1).days(0).get_sign(), b::Sign::Zero);
+        assert_eq!(Span::new().days(-1).days(0).get_sign(), b::Sign::Zero);
         assert_eq!(
-            Span::new().years(1).days(1).days(0).get_sign_ranged(),
-            C(1)
+            Span::new().years(1).days(1).days(0).get_sign(),
+            b::Sign::Positive,
         );
         assert_eq!(
-            Span::new().years(-1).days(-1).days(0).get_sign_ranged(),
-            C(-1)
+            Span::new().years(-1).days(-1).days(0).get_sign(),
+            b::Sign::Negative,
         );
     }
 
@@ -7108,7 +6891,7 @@ mod tests {
             #[cfg(debug_assertions)]
             {
                 assert_eq!(core::mem::align_of::<Span>(), 8);
-                assert_eq!(core::mem::size_of::<Span>(), 184);
+                assert_eq!(core::mem::size_of::<Span>(), 64);
             }
             #[cfg(not(debug_assertions))]
             {
@@ -7124,9 +6907,9 @@ mod tests {
             if largest > Unit::Day {
                 return quickcheck::TestResult::discard();
             }
-            let nanos = span.to_invariant_nanoseconds();
-            let got = Span::from_invariant_nanoseconds(largest, nanos).unwrap();
-            quickcheck::TestResult::from_bool(nanos == got.to_invariant_nanoseconds())
+            let dur = span.to_invariant_duration();
+            let got = Span::from_invariant_duration(largest, dur).unwrap();
+            quickcheck::TestResult::from_bool(dur == got.to_invariant_duration())
         }
     }
 
@@ -7272,15 +7055,15 @@ mod tests {
 
         insta::assert_snapshot!(
             p("").unwrap_err(),
-            @"an empty string is not a valid `Span`, expected either a ISO 8601 or Jiff's 'friendly' format",
+            @r#"an empty string is not a valid duration in either the ISO 8601 format or Jiff's "friendly" format"#,
         );
         insta::assert_snapshot!(
             p("+").unwrap_err(),
-            @"found nothing after sign `+`, which is not a valid `Span`, expected either a ISO 8601 or Jiff's 'friendly' format",
+            @r#"found nothing after sign `+`, which is not a valid duration in either the ISO 8601 format or Jiff's "friendly" format"#,
         );
         insta::assert_snapshot!(
             p("-").unwrap_err(),
-            @"found nothing after sign `-`, which is not a valid `Span`, expected either a ISO 8601 or Jiff's 'friendly' format",
+            @r#"found nothing after sign `-`, which is not a valid duration in either the ISO 8601 format or Jiff's "friendly" format"#,
         );
     }
 
@@ -7317,15 +7100,87 @@ mod tests {
 
         insta::assert_snapshot!(
             p("").unwrap_err(),
-            @"an empty string is not a valid `Span`, expected either a ISO 8601 or Jiff's 'friendly' format at line 1 column 2",
+            @r#"an empty string is not a valid duration in either the ISO 8601 format or Jiff's "friendly" format at line 1 column 2"#,
         );
         insta::assert_snapshot!(
             p("+").unwrap_err(),
-            @"found nothing after sign `+`, which is not a valid `Span`, expected either a ISO 8601 or Jiff's 'friendly' format at line 1 column 3",
+            @r#"found nothing after sign `+`, which is not a valid duration in either the ISO 8601 format or Jiff's "friendly" format at line 1 column 3"#,
         );
         insta::assert_snapshot!(
             p("-").unwrap_err(),
-            @"found nothing after sign `-`, which is not a valid `Span`, expected either a ISO 8601 or Jiff's 'friendly' format at line 1 column 3",
+            @r#"found nothing after sign `-`, which is not a valid duration in either the ISO 8601 format or Jiff's "friendly" format at line 1 column 3"#,
+        );
+    }
+
+    // This ensures that adding maximum invariant durations doesn't overflow.
+    #[test]
+    fn maximum_invariant_duration() {
+        let span = Span::new()
+            .weeks(b::SpanWeeks::MAX)
+            .days(b::SpanDays::MAX)
+            .hours(b::SpanHours::MAX)
+            .minutes(b::SpanMinutes::MAX)
+            .seconds(b::SpanSeconds::MAX)
+            .milliseconds(b::SpanMilliseconds::MAX)
+            .microseconds(b::SpanMicroseconds::MAX)
+            .nanoseconds(b::SpanNanoseconds::MAX);
+
+        let dur = span.to_invariant_duration();
+        assert_eq!(dur.as_secs(), 4_426_974_863_236);
+        assert_eq!(
+            dur,
+            // 1229715239h 47m 16s 854ms 775µs 807ns
+            SignedDuration::new(
+                1_229_715_239 * 60 * 60 + 47 * 60 + 16,
+                854_775_807
+            ),
+        );
+
+        let sum = dur + dur;
+        assert_eq!(sum.as_secs(), 8_853_949_726_473);
+        assert_eq!(
+            sum,
+            // 2459430479h 34m 33s 709ms 551µs 614ns
+            SignedDuration::new(
+                2_459_430_479 * 60 * 60 + 34 * 60 + 33,
+                709_551_614,
+            ),
+        );
+    }
+
+    // This ensures that adding minimum invariant durations doesn't overflow.
+    #[test]
+    fn minimum_invariant_duration() {
+        let span = Span::new()
+            .weeks(b::SpanWeeks::MIN)
+            .days(b::SpanDays::MIN)
+            .hours(b::SpanHours::MIN)
+            .minutes(b::SpanMinutes::MIN)
+            .seconds(b::SpanSeconds::MIN)
+            .milliseconds(b::SpanMilliseconds::MIN)
+            .microseconds(b::SpanMicroseconds::MIN)
+            .nanoseconds(b::SpanNanoseconds::MIN);
+
+        let dur = span.to_invariant_duration();
+        assert_eq!(dur.as_secs(), -4_426_974_863_236);
+        assert_eq!(
+            dur,
+            // -1229715239h 47m 16s 854ms 775µs 807ns
+            -SignedDuration::new(
+                1_229_715_239 * 60 * 60 + 47 * 60 + 16,
+                854_775_807
+            ),
+        );
+
+        let sum = dur + dur;
+        assert_eq!(sum.as_secs(), -8_853_949_726_473);
+        assert_eq!(
+            sum,
+            // -2459430479h 34m 33s 709ms 551µs 614ns
+            -SignedDuration::new(
+                2_459_430_479 * 60 * 60 + 34 * 60 + 33,
+                709_551_614,
+            ),
         );
     }
 }

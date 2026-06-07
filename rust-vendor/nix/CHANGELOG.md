@@ -3,6 +3,93 @@ This project adheres to [Semantic Versioning](https://semver.org/).
 
 # Change Log
 
+## [0.31.2] - 2026-02-28
+
+### Added
+
+- Add WatchDescriptor::as_raw, to get libc id of WatchDescriptor.
+  ([#2718](https://github.com/nix-rust/nix/pull/2718))
+- Added process::pthread_getthreadid_np() on FreeBSD.
+  ([#2725](https://github.com/nix-rust/nix/pull/2725))
+- Added timerfd support on FreeBSD
+  ([#2728](https://github.com/nix-rust/nix/pull/2728))
+
+### Fixed
+
+- The libc requirement is now `0.2.181`, rather than pinned to 0.2.180.
+  ([#2744](https://github.com/nix-rust/nix/pull/2744))
+
+
+## [0.31.1] - 2026-01-23
+
+### Added
+
+- termios: Add definition for IUCLC to supported platforms
+  ([#2702](https://github.com/nix-rust/nix/pull/2702))
+- termios: Add definition for XCASE for supported platforms
+  ([#2703](https://github.com/nix-rust/nix/pull/2703))
+
+
+## [0.31.0] - 2026-01-22
+
+### Added
+
+- Added the UDP GSO/GRO socket options and CMsgs on Android. This includes the
+  following types:
+  - UdpGsoSegment
+  - UdpGroSegment
+  - ControlMessage::UdpGsoSegments
+  - ControlMessageOwned::UdpGroSegments
+
+  ([#2666](https://github.com/nix-rust/nix/pull/2666))
+- Define errno EWOULDBLOCK as an alias of EAGAIN to match the AIX libc
+  definition. ([#2692](https://github.com/nix-rust/nix/pull/2692))
+- Enable module `ifaddrs` on GNU Hurd
+  ([#2697](https://github.com/nix-rust/nix/pull/2697))
+- Add termios `OutputFlags::OFILL` for Linux, Android, Aix, Cygwin, Fuchsia,
+  Haiku,
+  GNU/Hurd, Nto, Redox, Illumos, Solaris and Apple OSes.
+  ([#2701](https://github.com/nix-rust/nix/pull/2701))
+- add sync() for cygwin ([#2708](https://github.com/nix-rust/nix/pull/2708))
+
+### Changed
+
+- changed `EpollEvent` methods to be `const`
+  ([#2656](https://github.com/nix-rust/nix/pull/2656))
+- Bumped libc to
+  [0.2.180](https://github.com/rust-lang/libc/releases/tag/0.2.180)
+  ([#2724](https://github.com/nix-rust/nix/pull/2724))
+
+### Fixed
+
+- Fixed `nix::sys::ptrace::syscall_info`, which was not setting the `data`
+  argument properly, causing garbage values to be returned.
+  ([#2653](https://github.com/nix-rust/nix/pull/2653))
+- Cast the 'addr' argument of 'madvise()' to '*mut u8' on AIX to match the
+  signature in the AIX libc.
+  ([#2655](https://github.com/nix-rust/nix/pull/2655))
+- Fixed the Dir module on NTO, Solaris, Hurd, and possibly other platforms.
+  The
+  d_name field was not copied correctly on those platforms.  For some other
+  platforms, it could be copied incorrectly for files with very long pathnames.
+  ([#2674](https://github.com/nix-rust/nix/pull/2674))
+- Fix the build on Illumos ([#2694](https://github.com/nix-rust/nix/pull/2694))
+
+### Removed
+
+- Removed `Eq` and `PartialEq` implementations from `SigHandler`, because they
+  never worked reliably.  The suggested alternative is `matches!`.  For
+  example:
+  ```
+  let h: SigHandler = ...
+  if matches!(h, SigHandler::SigIgn) {
+      ...
+  }
+  ``` ([#2642](https://github.com/nix-rust/nix/pull/2642))
+- Removed `IFF_NOTRAILERS` by NetBSD, as it has been removed upstream and from
+  libc ([#2724](https://github.com/nix-rust/nix/pull/2724))
+
+
 ## [0.30.1] - 2025-05-04
 
 ### Fixed

@@ -1,13 +1,11 @@
-diff --git a/src/krun_display/Cargo.toml b/src/krun_display/Cargo.toml
-index a566cd2b..a2fd7c99 100644
---- a/src/krun_display/Cargo.toml
-+++ b/src/krun_display/Cargo.toml
+--- a/src/display/Cargo.toml
++++ b/src/display/Cargo.toml
 @@ -2,7 +2,7 @@
- name = "krun_display"
+ name = "krun-display"
  description = "Rust bindings for implemeting display backends in Rust for libkrun"
  version = "0.1.0"
 -edition = "2024"
 +edition = "2021"
+ license = "Apache-2.0"
+ repository = "https://github.com/containers/libkrun"
  
- [dependencies]
- thiserror = "2.0.12"

@@ -13,7 +13,7 @@
 // ignored because https://gitlab.freedesktop.org/pipewire/pipewire-rs/-/issues/19
 //! ```no_run
 //! use std::{time::Duration, sync::mpsc, thread};
-//! use pipewire::main_loop::MainLoop;
+//! use pipewire::main_loop::MainLoopRc;
 //!
 //! // Our message to the pipewire loop, this tells it to terminate.
 //! struct Terminate;
@@ -42,7 +42,7 @@
 //!     main_sender: mpsc::Sender<String>,
 //!     pw_receiver: pipewire::channel::Receiver<Terminate>
 //! ) {
-//!     let mainloop = MainLoop::new(None).expect("Failed to create main loop");
+//!     let mainloop = MainLoopRc::new(None).expect("Failed to create main loop");
 //!
 //!     // When we receive a `Terminate` message, quit the main loop.
 //!     let _receiver = pw_receiver.attach(mainloop.loop_(), {
@@ -69,7 +69,7 @@ use std::{
     sync::{Arc, Mutex},
 };
 
-use crate::loop_::{IoSource, LoopRef};
+use crate::loop_::{IoSource, Loop};
 use spa::support::system::IoFlags;
 
 /// A receiver that has not been attached to a loop.
@@ -84,12 +84,16 @@ impl<T: 'static> Receiver<T> {
     ///
     /// This will make the loop call the callback with any messages that get sent to the receiver.
     #[must_use]
-    pub fn attach<F>(self, loop_: &LoopRef, callback: F) -> AttachedReceiver<T>
+    pub fn attach<F>(self, loop_: &Loop, callback: F) -> AttachedReceiver<T>
     where
         F: Fn(T) + 'static,
     {
         let channel = self.channel.clone();
-        let readfd = channel.lock().expect("Channel mutex lock poisoned").readfd;
+        let readfd = channel
+            .lock()
+            .expect("Channel mutex lock poisoned")
+            .readfd
+            .as_raw_fd();
 
         // Attach the pipe as an IO source to the loop.
         // Whenever the pipe is written to, call the users callback with each message in the queue.
@@ -97,7 +101,7 @@ impl<T: 'static> Receiver<T> {
             let mut channel = channel.lock().expect("Channel mutex lock poisoned");
 
             // Read from the pipe to make it block until written to again.
-            let _ = nix::unistd::read(channel.readfd, &mut [0]);
+            let _ = nix::unistd::read(&channel.readfd, &mut [0]);
 
             channel.queue.drain(..).for_each(&callback);
         });
@@ -162,7 +166,7 @@ impl<T> Sender<T> {
         // If no messages are waiting already, signal the receiver to read some.
         // Because the channel mutex is locked, it is alright to do this before pushing the message.
         if channel.queue.is_empty() {
-            match nix::unistd::write(channel.writefd, &[1u8]) {
+            match nix::unistd::write(&channel.writefd, &[1u8]) {
                 Ok(_) => (),
                 Err(_) => return Err(t),
             }
@@ -178,25 +182,16 @@ impl<T> Sender<T> {
 /// Shared state between the [`Sender`]s and the [`Receiver`].
 struct Channel<T> {
     /// A pipe used to signal the loop the receiver is attached to that messages are waiting.
-    readfd: RawFd,
-    writefd: RawFd,
+    readfd: OwnedFd,
+    writefd: OwnedFd,
     /// Queue of any messages waiting to be received.
     queue: VecDeque<T>,
-}
-
-impl<T> Drop for Channel<T> {
-    fn drop(&mut self) {
-        // We do not error check here, because the pipe does not contain any data that might be lost,
-        // and because there is no way to handle an error in a `Drop` implementation anyways.
-        let _ = nix::unistd::close(self.readfd);
-        let _ = nix::unistd::close(self.writefd);
-    }
 }
 
 /// Create a Sender-Receiver pair, where the sender can be used to send messages to the receiver.
 ///
 /// This functions similar to [`std::sync::mpsc`], but with a receiver that can be attached to any
-/// [`LoopRef`](`crate::loop_::LoopRef`) to have the loop invoke a callback with any new messages.
+/// [`Loop`](`crate::loop_::Loop`) to have the loop invoke a callback with any new messages.
 ///
 /// This can be used for inter-thread communication without shared state and where [`std::sync::mpsc`] can not be used
 /// because the receiving thread is running the pipewire loop.

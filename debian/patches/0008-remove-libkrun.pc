@@ -1,6 +1,6 @@
 --- a/Makefile
 +++ b/Makefile
-@@ -103,14 +103,14 @@
+@@ -80,14 +80,14 @@
  LIBRARY_RELEASE_Darwin = target/release/$(KRUN_BINARY_Darwin)
  LIBRARY_DEBUG_Darwin = target/debug/$(KRUN_BINARY_Darwin)
  

@@ -166,12 +166,11 @@ and features.)
 */
 
 use crate::{
-    error::{err, Error},
+    error::{fmt::Error as E, Error},
     util::escape,
 };
 
-use self::util::{Decimal, DecimalFormatter, Fractional, FractionalFormatter};
-
+mod buffer;
 pub mod friendly;
 mod offset;
 pub mod rfc2822;
@@ -196,6 +195,17 @@ pub(crate) struct Parsed<'i, V> {
     input: &'i [u8],
 }
 
+impl<'i, V> Parsed<'i, V> {
+    #[inline]
+    fn and_then<U>(
+        self,
+        map: impl FnOnce(V) -> Result<U, Error>,
+    ) -> Result<Parsed<'i, U>, Error> {
+        let Parsed { value, input } = self;
+        Ok(Parsed { value: map(value)?, input })
+    }
+}
+
 impl<'i, V: core::fmt::Display> Parsed<'i, V> {
     /// Ensures that the parsed value represents the entire input. This occurs
     /// precisely when the `input` on this parsed value is empty.
@@ -207,12 +217,28 @@ impl<'i, V: core::fmt::Display> Parsed<'i, V> {
         if self.input.is_empty() {
             return Ok(self.value);
         }
-        Err(err!(
-            "parsed value '{value}', but unparsed input {unparsed:?} \
-             remains (expected no unparsed input)",
-            value = self.value,
-            unparsed = escape::Bytes(self.input),
-        ))
+        Err(Error::from(E::into_full_error(&self.value, self.input)))
+    }
+}
+
+impl<'i, V> Parsed<'i, V> {
+    /// Ensures that the parsed value represents the entire input. This occurs
+    /// precisely when the `input` on this parsed value is empty.
+    ///
+    /// This is useful when one expects a parsed value to consume the entire
+    /// input, and to consider it an error if it doesn't.
+    ///
+    /// This is like `Parsed::into_full`, but lets the caller provide a custom
+    /// `Display` implementation.
+    #[inline]
+    fn into_full_with(
+        self,
+        display: impl core::fmt::Display,
+    ) -> Result<V, Error> {
+        if self.input.is_empty() {
+            return Ok(self.value);
+        }
+        Err(Error::from(E::into_full_error(&display, self.input)))
     }
 }
 
@@ -249,8 +275,9 @@ impl<'i, V: core::fmt::Debug> core::fmt::Debug for Parsed<'i, V> {
 /// The `std::fmt::Write` trait wasn't used itself because:
 ///
 /// 1. Using a custom trait allows us to require using Jiff's error type.
-/// (Although this extra flexibility isn't currently used, since printing only
-/// fails when writing to the underlying buffer or stream fails.)
+/// (Although this extra flexibility isn't currently used much, since printing
+/// rarely fails for any reason other than the underlying `jiff::fmt::Write`
+/// implementation failing.)
 /// 2. Using a custom trait allows us more control over the implementations of
 /// the trait. For example, a custom trait means we can format directly into
 /// a `Vec<u8>` buffer, which isn't possible with `std::fmt::Write` because
@@ -266,6 +293,25 @@ pub trait Write {
     fn write_char(&mut self, char: char) -> Result<(), Error> {
         self.write_str(char.encode_utf8(&mut [0; 4]))
     }
+
+    /// Returns a `Vec<u8>` backing store for this implementation.
+    ///
+    /// Consumers of this trait may call this method to get a view directly
+    /// into a buffer for more optimized writing.
+    ///
+    /// The default implementation always returns `None`.
+    ///
+    /// This method is only available when Jiff's `alloc` feature is enabled.
+    ///
+    /// # Safety
+    ///
+    /// Callers must ensure that only valid UTF-8 is written to the buffer
+    /// returned.
+    #[cfg(feature = "alloc")]
+    #[inline]
+    unsafe fn as_mut_vec(&mut self) -> Option<&mut alloc::vec::Vec<u8>> {
+        None
+    }
 }
 
 #[cfg(any(test, feature = "alloc"))]
@@ -275,6 +321,13 @@ impl Write for alloc::string::String {
         self.push_str(string);
         Ok(())
     }
+
+    #[cfg(feature = "alloc")]
+    #[inline]
+    unsafe fn as_mut_vec(&mut self) -> Option<&mut alloc::vec::Vec<u8>> {
+        // SAFETY: The conditions are forwarded to the trait interface.
+        unsafe { Some(alloc::string::String::as_mut_vec(self)) }
+    }
 }
 
 #[cfg(any(test, feature = "alloc"))]
@@ -283,6 +336,12 @@ impl Write for alloc::vec::Vec<u8> {
     fn write_str(&mut self, string: &str) -> Result<(), Error> {
         self.extend_from_slice(string.as_bytes());
         Ok(())
+    }
+
+    #[cfg(feature = "alloc")]
+    #[inline]
+    unsafe fn as_mut_vec(&mut self) -> Option<&mut alloc::vec::Vec<u8>> {
+        Some(self)
     }
 }
 
@@ -294,6 +353,31 @@ impl<W: Write> Write for &mut W {
     #[inline]
     fn write_char(&mut self, char: char) -> Result<(), Error> {
         (**self).write_char(char)
+    }
+
+    #[cfg(feature = "alloc")]
+    #[inline]
+    unsafe fn as_mut_vec(&mut self) -> Option<&mut alloc::vec::Vec<u8>> {
+        // SAFETY: The conditions are forwarded to the trait interface.
+        unsafe { (**self).as_mut_vec() }
+    }
+}
+
+impl Write for &mut dyn Write {
+    fn write_str(&mut self, string: &str) -> Result<(), Error> {
+        (**self).write_str(string)
+    }
+
+    #[inline]
+    fn write_char(&mut self, char: char) -> Result<(), Error> {
+        (**self).write_char(char)
+    }
+
+    #[cfg(feature = "alloc")]
+    #[inline]
+    unsafe fn as_mut_vec(&mut self) -> Option<&mut alloc::vec::Vec<u8>> {
+        // SAFETY: The conditions are forwarded to the trait interface.
+        unsafe { (**self).as_mut_vec() }
     }
 }
 
@@ -331,7 +415,7 @@ pub struct StdIoWrite<W>(pub W);
 impl<W: std::io::Write> Write for StdIoWrite<W> {
     #[inline]
     fn write_str(&mut self, string: &str) -> Result<(), Error> {
-        self.0.write_all(string.as_bytes()).map_err(Error::adhoc)
+        self.0.write_all(string.as_bytes()).map_err(Error::io)
     }
 }
 
@@ -374,7 +458,7 @@ impl<W: core::fmt::Write> Write for StdFmtWrite<W> {
     fn write_str(&mut self, string: &str) -> Result<(), Error> {
         self.0
             .write_str(string)
-            .map_err(|_| err!("an error occurred when formatting an argument"))
+            .map_err(|_| Error::from(E::StdFmtWriteAdapter))
     }
 }
 
@@ -384,49 +468,3 @@ impl<W: Write> core::fmt::Write for StdFmtWrite<W> {
         self.0.write_str(string).map_err(|_| core::fmt::Error)
     }
 }
-
-/// An extension trait to `Write` that provides crate internal routines.
-///
-/// These routines aren't exposed because they make use of crate internal
-/// types. Those types could perhaps be exposed if there was strong demand,
-/// but I'm skeptical.
-trait WriteExt: Write {
-    /// Write the given number as a decimal using ASCII digits to this buffer.
-    /// The given formatter controls how the decimal is formatted.
-    #[inline]
-    fn write_int(
-        &mut self,
-        formatter: &DecimalFormatter,
-        n: impl Into<i64>,
-    ) -> Result<(), Error> {
-        self.write_decimal(&Decimal::new(formatter, n.into()))
-    }
-
-    /// Write the given fractional number using ASCII digits to this buffer.
-    /// The given formatter controls how the fractional number is formatted.
-    #[inline]
-    fn write_fraction(
-        &mut self,
-        formatter: &FractionalFormatter,
-        n: impl Into<i64>,
-    ) -> Result<(), Error> {
-        self.write_fractional(&Fractional::new(formatter, n.into()))
-    }
-
-    /// Write the given decimal number to this buffer.
-    #[inline]
-    fn write_decimal(&mut self, decimal: &Decimal) -> Result<(), Error> {
-        self.write_str(decimal.as_str())
-    }
-
-    /// Write the given fractional number to this buffer.
-    #[inline]
-    fn write_fractional(
-        &mut self,
-        fractional: &Fractional,
-    ) -> Result<(), Error> {
-        self.write_str(fractional.as_str())
-    }
-}
-
-impl<W: Write> WriteExt for W {}

@@ -1,3 +1,10 @@
+libkrun (1.18.1-1asahi1.26.04) resolute; urgency=medium
+
+  * Build for resolute
+  * Based on tag v1.18.1
+
+ -- Andreas Schröder <andreas@kernelpanik.net>  Sun, 7 Jun 2026 23:09:00 +0200
+
 libkrun (1.17.4-1asahi1.26.04) resolute; urgency=medium
 
   * Build for resolute

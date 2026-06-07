@@ -12,7 +12,7 @@
 [package]
 edition = "2021"
 name = "imago"
-version = "0.2.1"
+version = "0.2.2"
 build = "build.rs"
 autolib = false
 autobins = false
@@ -64,6 +64,7 @@ features = ["sync"]
 
 [dependencies.tracing]
 version = "0.1"
+features = ["attributes"]
 
 [dependencies.vm-memory]
 version = ">=0.16, <0.19"

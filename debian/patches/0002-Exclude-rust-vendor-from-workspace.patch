@@ -1,8 +1,9 @@
 --- a/Cargo.toml
 +++ b/Cargo.toml
-@@ -1,6 +1,6 @@
- [workspace]
- members = ["src/libkrun", "src/krun_input"]
+@@ -16,7 +16,7 @@
+     "src/aws_nitro",
+     "src/rutabaga_gfx",
+ ]
 -exclude = ["examples/gtk_display"]
 +exclude = ["examples/gtk_display", "rust-vendor"]
  resolver = "2"

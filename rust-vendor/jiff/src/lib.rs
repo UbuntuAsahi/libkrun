@@ -251,7 +251,7 @@ println!("{zdt}");
 # Ok::<(), Box<dyn std::error::Error>>(())
 ```
 
-Or, if the time is known to be valid, you can use the infallibe
+Or, if the time is known to be valid, you can use the infallible
 [`civil::time`](civil::time()) convenience constructor:
 
 ```
@@ -369,7 +369,7 @@ use jiff::civil::date;
 
 let zdt1 = date(2020, 8, 26).at(6, 27, 0, 0).in_tz("America/New_York")?;
 let zdt2 = date(2023, 12, 31).at(18, 30, 0, 0).in_tz("America/New_York")?;
-let span = &zdt2 - &zdt1;
+let span = zdt2 - zdt1;
 assert_eq!(format!("{span:#}"), "29341h 3m");
 
 # Ok::<(), Box<dyn std::error::Error>>(())
@@ -720,10 +720,10 @@ For more, see the [`fmt::serde`] sub-module. (This requires enabling Jiff's
     )),
     allow(dead_code, unused_imports)
 )]
-// No clue why this thing is still unstable because it's pretty amazing. This
-// adds Cargo feature annotations to items in the rustdoc output. Which is
+#![cfg_attr(miri, allow(dead_code, unused_imports))]
+// This adds Cargo feature annotations to items in the rustdoc output. Which is
 // sadly hugely beneficial for this crate due to the number of features.
-#![cfg_attr(docsrs, feature(doc_auto_cfg))]
+#![cfg_attr(docsrs_jiff, feature(doc_cfg))]
 // We generally want all types to impl Debug.
 #![warn(missing_debug_implementations)]
 // Document ALL THE THINGS!
@@ -759,8 +759,11 @@ pub use crate::{
         Timestamp, TimestampArithmetic, TimestampDifference,
         TimestampDisplayWithOffset, TimestampRound, TimestampSeries,
     },
-    util::round::mode::RoundMode,
-    zoned::{Zoned, ZonedArithmetic, ZonedDifference, ZonedRound, ZonedWith},
+    util::round::RoundMode,
+    zoned::{
+        Zoned, ZonedArithmetic, ZonedDifference, ZonedRound, ZonedSeries,
+        ZonedWith,
+    },
 };
 
 #[macro_use]
@@ -809,38 +812,38 @@ mod tests {
     #[cfg(feature = "std")]
     #[test]
     fn ranges() {
-        use crate::util::t;
+        use crate::util::b;
 
-        dbg!((t::SpanYears::MIN, t::SpanYears::MAX));
-        dbg!((t::SpanMonths::MIN, t::SpanMonths::MAX));
-        dbg!((t::SpanWeeks::MIN, t::SpanWeeks::MAX));
-        dbg!((t::SpanDays::MIN, t::SpanDays::MAX));
-        dbg!((t::SpanHours::MIN, t::SpanHours::MAX));
-        dbg!((t::SpanMinutes::MIN, t::SpanMinutes::MAX));
-        dbg!((t::SpanSeconds::MIN, t::SpanSeconds::MAX));
-        dbg!((t::SpanMilliseconds::MIN, t::SpanMilliseconds::MAX));
-        dbg!((t::SpanMicroseconds::MIN, t::SpanMicroseconds::MAX));
-        dbg!((t::SpanNanoseconds::MIN, t::SpanNanoseconds::MAX));
-        dbg!((t::UnixSeconds::MIN, t::UnixSeconds::MAX));
-        dbg!((t::UnixEpochDay::MIN, t::UnixEpochDay::MAX));
+        dbg!((b::SpanYears::MIN, b::SpanYears::MAX));
+        dbg!((b::SpanMonths::MIN, b::SpanMonths::MAX));
+        dbg!((b::SpanWeeks::MIN, b::SpanWeeks::MAX));
+        dbg!((b::SpanDays::MIN, b::SpanDays::MAX));
+        dbg!((b::SpanHours::MIN, b::SpanHours::MAX));
+        dbg!((b::SpanMinutes::MIN, b::SpanMinutes::MAX));
+        dbg!((b::SpanSeconds::MIN, b::SpanSeconds::MAX));
+        dbg!((b::SpanMilliseconds::MIN, b::SpanMilliseconds::MAX));
+        dbg!((b::SpanMicroseconds::MIN, b::SpanMicroseconds::MAX));
+        dbg!((b::SpanNanoseconds::MIN, b::SpanNanoseconds::MAX));
+        dbg!((b::UnixSeconds::MIN, b::UnixSeconds::MAX));
+        dbg!((b::UnixEpochDays::MIN, b::UnixEpochDays::MAX));
     }
 
     #[cfg(feature = "std")]
     #[test]
     fn maximally_long_span() {
-        use crate::{fmt::friendly, util::t};
+        use crate::{fmt::friendly, util::b};
 
         let span = Span::new()
-            .years(t::SpanYears::MAX_REPR)
-            .months(t::SpanMonths::MAX_REPR)
-            .weeks(t::SpanWeeks::MAX_REPR)
-            .days(t::SpanDays::MAX_REPR)
-            .hours(t::SpanHours::MAX_REPR)
-            .minutes(t::SpanMinutes::MAX_REPR)
-            .seconds(t::SpanSeconds::MAX_REPR)
-            .milliseconds(t::SpanMilliseconds::MAX_REPR)
-            .microseconds(t::SpanMicroseconds::MAX_REPR)
-            .nanoseconds(t::SpanNanoseconds::MAX_REPR)
+            .years(b::SpanYears::MAX)
+            .months(b::SpanMonths::MAX)
+            .weeks(b::SpanWeeks::MAX)
+            .days(b::SpanDays::MAX)
+            .hours(b::SpanHours::MAX)
+            .minutes(b::SpanMinutes::MAX)
+            .seconds(b::SpanSeconds::MAX)
+            .milliseconds(b::SpanMilliseconds::MAX)
+            .microseconds(b::SpanMicroseconds::MAX)
+            .nanoseconds(b::SpanNanoseconds::MAX)
             .negate();
         std::println!("{span}");
         std::println!("{span:#}");

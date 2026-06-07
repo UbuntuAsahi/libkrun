@@ -1295,12 +1295,36 @@ impl<'bump, T: 'bump> Vec<'bump, T> {
     /// let b = Bump::new();
     ///
     /// let mut vec = bumpalo::vec![in &b; 1, 2, 3, 4];
-    /// vec.retain(|&x| x % 2 == 0);
+    /// vec.retain(|x: &i32| *x % 2 == 0);
     /// assert_eq!(vec, [2, 4]);
     /// ```
     pub fn retain<F>(&mut self, mut f: F)
     where
         F: FnMut(&T) -> bool,
+    {
+        self.drain_filter(|x| !f(x));
+    }
+
+    /// Retains only the elements specified by the predicate.
+    ///
+    /// In other words, remove all elements `e` such that `f(&mut e)` returns `false`.
+    /// This method operates in place and preserves the order of the retained
+    /// elements.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use bumpalo::{Bump, collections::Vec};
+    ///
+    /// let b = Bump::new();
+    ///
+    /// let mut vec = bumpalo::vec![in &b; 1, 2, 3, 4];
+    /// vec.retain_mut(|x: &mut i32| *x % 2 == 0);
+    /// assert_eq!(vec, [2, 4]);
+    /// ```
+    pub fn retain_mut<F>(&mut self, mut f: F)
+    where
+        F: FnMut(&mut T) -> bool,
     {
         self.drain_filter(|x| !f(x));
     }
@@ -1487,6 +1511,33 @@ impl<'bump, T: 'bump> Vec<'bump, T> {
         }
     }
 
+    /// Removes and returns the last element from a vector if the predicate
+    /// returns `true`, or [`None`] if the predicate returns false or the vector
+    /// is empty (the predicate will not be called in that case).
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use bumpalo::{Bump, collections::Vec};
+    ///
+    /// let b = Bump::new();
+    /// let mut vec = bumpalo::vec![in &b; 1, 2, 3, 4];
+    /// let pred = |x: &mut i32| *x % 2 == 0;
+    ///
+    /// assert_eq!(vec.pop_if(pred), Some(4));
+    /// assert_eq!(vec, [1, 2, 3]);
+    /// assert_eq!(vec.pop_if(pred), None);
+    /// ```
+    #[inline]
+    pub fn pop_if(&mut self, predicate: impl FnOnce(&mut T) -> bool) -> Option<T> {
+        let last = self.last_mut()?;
+        if predicate(last) {
+            self.pop()
+        } else {
+            None
+        }
+    }
+
     /// Moves all the elements of `other` into `Self`, leaving `other` empty.
     ///
     /// # Panics
@@ -1557,7 +1608,7 @@ impl<'bump, T: 'bump> Vec<'bump, T> {
     /// v.drain(..);
     /// assert_eq!(v, &[]);
     /// ```
-    pub fn drain<R>(&mut self, range: R) -> Drain<T>
+    pub fn drain<'a, R>(&'a mut self, range: R) -> Drain<'a, 'bump, T>
     where
         R: RangeBounds<usize>,
     {
@@ -2359,7 +2410,11 @@ impl<'bump, T: 'bump> Vec<'bump, T> {
     /// assert_eq!(u, &[1, 2]);
     /// ```
     #[inline]
-    pub fn splice<R, I>(&mut self, range: R, replace_with: I) -> Splice<I::IntoIter>
+    pub fn splice<'a, R, I>(
+        &'a mut self,
+        range: R,
+        replace_with: I,
+    ) -> Splice<'a, 'bump, I::IntoIter>
     where
         R: RangeBounds<usize>,
         I: IntoIterator<Item = T>,
@@ -2737,7 +2792,11 @@ impl<'a, 'bump, T> FusedIterator for Drain<'a, 'bump, T> {}
 /// This struct is created by the [`Vec::splice`] method. See its
 /// documentation for more information.
 #[derive(Debug)]
-pub struct Splice<'a, 'bump, I: Iterator + 'a + 'bump> {
+pub struct Splice<'a, 'bump, I>
+where
+    I: Iterator,
+    I::Item: 'a + 'bump,
+{
     drain: Drain<'a, 'bump, I::Item>,
     replace_with: I,
 }

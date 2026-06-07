@@ -16,9 +16,11 @@
     clippy::needless_else,
     clippy::never_loop,
     clippy::overly_complex_bool_expr,
+    clippy::ptr_cast_constness,
     clippy::redundant_closure_call,
     clippy::redundant_pattern_matching,
     clippy::too_many_lines,
+    clippy::uninlined_format_args,
     clippy::unit_arg,
     clippy::unnecessary_cast,
     clippy::while_immutable_condition,
@@ -668,7 +670,7 @@ fn test_as() {
     assert_err(test, "Condition failed: `0 as int![...] != 0` (0 vs 0)");
 
     let test = || Ok(ensure!(0 as int! {...} != 0));
-    assert_err(test, "Condition failed: `0 as int! { ... } != 0` (0 vs 0)");
+    assert_err(test, "Condition failed: `0 as int! {...} != 0` (0 vs 0)");
 }
 
 #[test]

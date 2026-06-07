@@ -146,9 +146,8 @@ use crate::{
 ///
 /// assert_eq!(
 ///     "2025-01-03T17:28-05".parse::<Zoned>().unwrap_err().to_string(),
-///     "failed to find time zone in square brackets in \
-///      \"2025-01-03T17:28-05\", which is required for \
-///      parsing a zoned instant",
+///     "failed to find time zone annotation in square brackets, \
+///      which is required for parsing a zoned datetime",
 /// );
 /// ```
 ///
@@ -1036,7 +1035,7 @@ impl<'n> Pieces<'n> {
     /// Converts this `Pieces` into an "owned" value whose lifetime is
     /// `'static`.
     ///
-    /// Ths "owned" value in this context refers to the time zone annotation
+    /// The "owned" value in this context refers to the time zone annotation
     /// name, if present. For example, `Canada/Yukon` in
     /// `2025-01-03T07:55-07[Canada/Yukon]`. When parsing into a `Pieces`,
     /// the time zone annotation name is borrowed. But callers may find it more

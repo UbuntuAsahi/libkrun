@@ -1,3 +1,19 @@
+# 0.1.31 (November 26, 2025)
+
+### Added
+
+- Support constant expressions as instrument field names ([#3158])
+
+[#3158]: https://github.com/tokio-rs/tracing/pull/#3158
+
+# 0.1.30 (June 17, 2025)
+
+### Fixed
+
+- Fix `tracing::instrument` regression around shadowing ([#3311])
+
+[#3311]: https://github.com/tokio-rs/tracing/pull/3311
+
 # 0.1.29 (June 6, 2025)
 
 ### Changed

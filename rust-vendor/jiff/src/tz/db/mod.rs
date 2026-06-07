@@ -1,5 +1,5 @@
 use crate::{
-    error::{err, Error},
+    error::{tz::db::Error as E, Error},
     tz::TimeZone,
     util::{sync::Arc, utf8},
 };
@@ -29,12 +29,14 @@ mod zoneinfo;
 /// assert!(tz::db().get("does-not-exist").is_err());
 /// ```
 pub fn db() -> &'static TimeZoneDatabase {
-    #[cfg(any(not(feature = "std"), miri))]
+    // #[cfg(any(not(feature = "std"), miri))]
+    #[cfg(not(feature = "std"))]
     {
         static NONE: TimeZoneDatabase = TimeZoneDatabase::none();
         &NONE
     }
-    #[cfg(all(feature = "std", not(miri)))]
+    // #[cfg(all(feature = "std", not(miri)))]
+    #[cfg(feature = "std")]
     {
         use std::sync::OnceLock;
 
@@ -254,25 +256,28 @@ impl TimeZoneDatabase {
         // platforms? Probably not to be honest. But these should only be
         // executed ~once generally, so it doesn't seem like a big deal to try.
         // And trying makes things a little more flexible I think.
-        if cfg!(target_os = "android") {
-            let db = concatenated::Database::from_env();
-            if !db.is_definitively_empty() {
-                return TimeZoneDatabase::new(Kind::Concatenated(db));
-            }
+        #[cfg(not(miri))]
+        {
+            if cfg!(target_os = "android") {
+                let db = concatenated::Database::from_env();
+                if !db.is_definitively_empty() {
+                    return TimeZoneDatabase::new(Kind::Concatenated(db));
+                }
 
-            let db = zoneinfo::Database::from_env();
-            if !db.is_definitively_empty() {
-                return TimeZoneDatabase::new(Kind::ZoneInfo(db));
-            }
-        } else {
-            let db = zoneinfo::Database::from_env();
-            if !db.is_definitively_empty() {
-                return TimeZoneDatabase::new(Kind::ZoneInfo(db));
-            }
+                let db = zoneinfo::Database::from_env();
+                if !db.is_definitively_empty() {
+                    return TimeZoneDatabase::new(Kind::ZoneInfo(db));
+                }
+            } else {
+                let db = zoneinfo::Database::from_env();
+                if !db.is_definitively_empty() {
+                    return TimeZoneDatabase::new(Kind::ZoneInfo(db));
+                }
 
-            let db = concatenated::Database::from_env();
-            if !db.is_definitively_empty() {
-                return TimeZoneDatabase::new(Kind::Concatenated(db));
+                let db = concatenated::Database::from_env();
+                if !db.is_definitively_empty() {
+                    return TimeZoneDatabase::new(Kind::Concatenated(db));
+                }
             }
         }
 
@@ -457,22 +462,10 @@ impl TimeZoneDatabase {
     /// # Ok::<(), Box<dyn std::error::Error>>(())
     /// ```
     pub fn get(&self, name: &str) -> Result<TimeZone, Error> {
-        let inner = self.inner.as_deref().ok_or_else(|| {
-            if cfg!(feature = "std") {
-                err!(
-                    "failed to find time zone `{name}` since there is no \
-                     time zone database configured",
-                )
-            } else {
-                err!(
-                    "failed to find time zone `{name}`, there is no \
-                     global time zone database configured (and is currently \
-                     impossible to do so without Jiff's `std` feature \
-                     enabled, if you need this functionality, please file \
-                     an issue on Jiff's tracker with your use case)",
-                )
-            }
-        })?;
+        let inner = self
+            .inner
+            .as_deref()
+            .ok_or_else(|| E::failed_time_zone_no_database_configured(name))?;
         match *inner {
             Kind::ZoneInfo(ref db) => {
                 if let Some(tz) = db.get(name) {
@@ -493,7 +486,7 @@ impl TimeZoneDatabase {
                 }
             }
         }
-        Err(err!("failed to find time zone `{name}` in time zone database"))
+        Err(Error::from(E::failed_time_zone(name)))
     }
 
     /// Returns a list of all available time zone identifiers from this
@@ -572,16 +565,16 @@ impl TimeZoneDatabase {
 
 impl core::fmt::Debug for TimeZoneDatabase {
     fn fmt(&self, f: &mut core::fmt::Formatter) -> core::fmt::Result {
-        write!(f, "TimeZoneDatabase(")?;
+        f.write_str("TimeZoneDatabase(")?;
         let Some(inner) = self.inner.as_deref() else {
-            return write!(f, "unavailable)");
+            return f.write_str("unavailable)");
         };
         match *inner {
-            Kind::ZoneInfo(ref db) => write!(f, "{db:?}")?,
-            Kind::Concatenated(ref db) => write!(f, "{db:?}")?,
-            Kind::Bundled(ref db) => write!(f, "{db:?}")?,
+            Kind::ZoneInfo(ref db) => core::fmt::Debug::fmt(db, f)?,
+            Kind::Concatenated(ref db) => core::fmt::Debug::fmt(db, f)?,
+            Kind::Bundled(ref db) => core::fmt::Debug::fmt(db, f)?,
         }
-        write!(f, ")")
+        f.write_str(")")
     }
 }
 
@@ -687,7 +680,7 @@ impl<'d> TimeZoneName<'d> {
 
 impl<'d> core::fmt::Display for TimeZoneName<'d> {
     fn fmt(&self, f: &mut core::fmt::Formatter) -> core::fmt::Result {
-        write!(f, "{}", self.as_str())
+        f.write_str(self.as_str())
     }
 }
 

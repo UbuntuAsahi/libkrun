@@ -102,7 +102,6 @@ impl DictRef {
     ///
     /// # Examples
     /// ```
-    /// use libspa::prelude::*;
     /// use libspa::{utils::dict::StaticDict, static_dict};
     ///
     /// static DICT: StaticDict = static_dict! {
@@ -145,9 +144,7 @@ impl std::fmt::Debug for DictRef {
 
         impl<'a> fmt::Debug for Entries<'a> {
             fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-                f.debug_map()
-                    .entries(self.0.clone().map(|(k, v)| (k, v)))
-                    .finish()
+                f.debug_map().entries(self.0.clone()).finish()
             }
         }
 
@@ -392,7 +389,7 @@ macro_rules! static_dict {
         };
 
         unsafe {
-            let ptr = &RAW as *const _ as *mut _;
+            let ptr = std::ptr::addr_of!(RAW).cast_mut();
             StaticDict::from_ptr(ptr::NonNull::new_unchecked(ptr))
         }
     }};
@@ -421,7 +418,7 @@ unsafe impl Sync for StaticDict {}
 mod tests {
     use super::{DictRef, Flags, StaticDict};
     use spa_sys::spa_dict;
-    use std::{ffi::CString, ptr};
+    use std::ptr;
 
     #[test]
     fn test_empty_dict() {
@@ -447,20 +444,8 @@ mod tests {
         };
 
         let mut iter = dict.iter_cstr();
-        assert_eq!(
-            (
-                CString::new("K0").unwrap().as_c_str(),
-                CString::new("V0").unwrap().as_c_str()
-            ),
-            iter.next().unwrap()
-        );
-        assert_eq!(
-            (
-                CString::new("K1").unwrap().as_c_str(),
-                CString::new("V1").unwrap().as_c_str()
-            ),
-            iter.next().unwrap()
-        );
+        assert_eq!((c"K0", c"V0"), iter.next().unwrap());
+        assert_eq!((c"K1", c"V1"), iter.next().unwrap());
         assert_eq!(None, iter.next());
     }
 

@@ -17,19 +17,20 @@ pub const CHAN_SIZE: usize = std::mem::size_of::<i16>();
 
 pub fn main() -> Result<(), pw::Error> {
     pw::init();
-    let mainloop = pw::main_loop::MainLoop::new(None)?;
-    let context = pw::context::Context::new(&mainloop)?;
-    let core = context.connect(None)?;
+    let mainloop = pw::main_loop::MainLoopRc::new(None)?;
+    let context = pw::context::ContextRc::new(&mainloop, None)?;
+    let core = context.connect_rc(None)?;
 
     let data: f64 = 0.0;
 
-    let stream = pw::stream::Stream::new(
+    let stream = pw::stream::StreamBox::new(
         &core,
         "audio-src",
         properties! {
             *pw::keys::MEDIA_TYPE => "Audio",
             *pw::keys::MEDIA_ROLE => "Music",
             *pw::keys::MEDIA_CATEGORY => "Playback",
+            *pw::keys::AUDIO_CHANNELS => "2",
         },
     )?;
 
@@ -72,6 +73,10 @@ pub fn main() -> Result<(), pw::Error> {
     audio_info.set_format(spa::param::audio::AudioFormat::S16LE);
     audio_info.set_rate(DEFAULT_RATE);
     audio_info.set_channels(DEFAULT_CHANNELS);
+    let mut position = [0; spa::param::audio::MAX_CHANNELS];
+    position[0] = spa_sys::SPA_AUDIO_CHANNEL_FL;
+    position[1] = spa_sys::SPA_AUDIO_CHANNEL_FR;
+    audio_info.set_position(position);
 
     let values: Vec<u8> = pw::spa::pod::serialize::PodSerializer::serialize(
         std::io::Cursor::new(Vec::new()),

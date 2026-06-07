@@ -1,6 +1,6 @@
 use crate::{
     civil::DateTime,
-    error::{err, Error},
+    error::{tz::timezone::Error as E, Error},
     tz::{
         ambiguous::{AmbiguousOffset, AmbiguousTimestamp, AmbiguousZoned},
         offset::{Dst, Offset},
@@ -9,7 +9,6 @@ use crate::{
     Timestamp, Zoned,
 };
 
-#[cfg(feature = "alloc")]
 use crate::tz::posix::PosixTimeZoneOwned;
 
 use self::repr::Repr;
@@ -83,14 +82,15 @@ use self::repr::Repr;
 ///
 /// The system time zone can be retrieved via [`TimeZone::system`]. If it
 /// couldn't be detected or if the `tz-system` crate feature is not enabled,
-/// then [`TimeZone::UTC`] is returned. `TimeZone::system` is what's used
+/// then [`TimeZone::unknown`] is returned. `TimeZone::system` is what's used
 /// internally for retrieving the current zoned datetime via [`Zoned::now`].
 ///
 /// While there is no platform independent way to detect your system's
 /// "default" time zone, Jiff employs best-effort heuristics to determine it.
-/// (For example, by examining `/etc/localtime` on Unix systems.) When the
-/// heuristics fail, Jiff will emit a `WARN` level log. It can be viewed by
-/// installing a `log` compatible logger, such as [`env_logger`].
+/// (For example, by examining `/etc/localtime` on Unix systems or the `TZ`
+/// environment variable.) When the heuristics fail, Jiff will emit a `WARN`
+/// level log. It can be viewed by installing a `log` compatible logger, such
+/// as [`env_logger`].
 ///
 /// # Custom time zones
 ///
@@ -110,10 +110,10 @@ use self::repr::Repr;
 ///
 /// # A `TimeZone` is cheap to clone
 ///
-/// A `TimeZone` can be cheaply cloned. It uses automic reference counting
+/// A `TimeZone` can be cheaply cloned. It uses automatic reference counting
 /// internally. When `alloc` is disabled, cloning a `TimeZone` is still cheap
 /// because POSIX time zones and TZif time zones are unsupported. Therefore,
-/// cloning a time zone does a deep copy (since automic reference counting is
+/// cloning a time zone does a deep copy (since automatic reference counting is
 /// not available), but the data being copied is small.
 ///
 /// # Time zone equality
@@ -391,10 +391,8 @@ impl TimeZone {
     pub fn try_system() -> Result<TimeZone, Error> {
         #[cfg(not(feature = "tz-system"))]
         {
-            Err(err!(
-                "failed to get system time zone since 'tz-system' \
-                 crate feature is not enabled",
-            ))
+            Err(Error::from(crate::error::CrateFeatureError::TzSystem)
+                .context(E::FailedSystem))
         }
         #[cfg(feature = "tz-system")]
         {
@@ -458,7 +456,7 @@ impl TimeZone {
     #[inline]
     pub const fn fixed(offset: Offset) -> TimeZone {
         // Not doing `offset == Offset::UTC` because of `const`.
-        if offset.seconds_ranged().get_unchecked() == 0 {
+        if offset.seconds() == 0 {
             return TimeZone::UTC;
         }
         let repr = Repr::fixed(offset);
@@ -545,7 +543,7 @@ impl TimeZone {
         Ok(TimeZone { repr })
     }
 
-    /// Returns a `TimeZone` that is specifially marked as "unknown."
+    /// Returns a `TimeZone` that is specifically marked as "unknown."
     ///
     /// This corresponds to the Unicode CLDR identifier `Etc/Unknown`, which
     /// is guaranteed to never be a valid IANA time zone identifier (as of
@@ -711,7 +709,6 @@ impl TimeZone {
     /// as POSIX time zones to POSIX time zones (e.g., fixed offset time
     /// zones). Instead, this only returns something when the actual
     /// representation of the time zone is a POSIX time zone.
-    #[cfg(feature = "alloc")]
     #[inline]
     pub(crate) fn posix_tz(&self) -> Option<&PosixTimeZoneOwned> {
         repr::each! {
@@ -753,7 +750,7 @@ impl TimeZone {
     /// As mentioned above, consider using `Zoned` instead:
     ///
     /// ```
-    /// use jiff::{tz::TimeZone, Timestamp};
+    /// use jiff::Timestamp;
     ///
     /// let zdt = Timestamp::UNIX_EPOCH.in_tz("Europe/Rome")?;
     /// assert_eq!(zdt.datetime().to_string(), "1970-01-01T01:00:00");
@@ -782,7 +779,7 @@ impl TimeZone {
     /// # Example
     ///
     /// ```
-    /// use jiff::{tz::{self, Dst, TimeZone}, Timestamp};
+    /// use jiff::{tz::{self, TimeZone}, Timestamp};
     ///
     /// let tz = TimeZone::get("America/New_York")?;
     ///
@@ -915,7 +912,7 @@ impl TimeZone {
     /// assert_eq!(
     ///     tz.to_fixed_offset().unwrap_err().to_string(),
     ///     "cannot convert non-fixed IANA time zone \
-    ///      to offset without timestamp or civil datetime",
+    ///      to offset without a timestamp or civil datetime",
     /// );
     ///
     /// let tz = TimeZone::UTC;
@@ -934,11 +931,7 @@ impl TimeZone {
     #[inline]
     pub fn to_fixed_offset(&self) -> Result<Offset, Error> {
         let mkerr = || {
-            err!(
-                "cannot convert non-fixed {kind} time zone to offset \
-                 without timestamp or civil datetime",
-                kind = self.kind_description(),
-            )
+            Error::from(E::ConvertNonFixed { kind: self.kind_description() })
         };
         repr::each! {
             &self.repr,
@@ -1356,10 +1349,10 @@ impl TimeZone {
 
     /// Used by the "preceding transitions" iterator.
     #[inline]
-    fn previous_transition(
-        &self,
+    fn previous_transition<'t>(
+        &'t self,
         timestamp: Timestamp,
-    ) -> Option<TimeZoneTransition> {
+    ) -> Option<TimeZoneTransition<'t>> {
         repr::each! {
             &self.repr,
             UTC => None,
@@ -1373,10 +1366,10 @@ impl TimeZone {
 
     /// Used by the "following transitions" iterator.
     #[inline]
-    fn next_transition(
-        &self,
+    fn next_transition<'t>(
+        &'t self,
         timestamp: Timestamp,
-    ) -> Option<TimeZoneTransition> {
+    ) -> Option<TimeZoneTransition<'t>> {
         repr::each! {
             &self.repr,
             UTC => None,
@@ -1391,7 +1384,7 @@ impl TimeZone {
     /// Returns a short description about the kind of this time zone.
     ///
     /// This is useful in error messages.
-    fn kind_description(&self) -> &str {
+    fn kind_description(&self) -> &'static str {
         repr::each! {
             &self.repr,
             UTC => "UTC",
@@ -1886,12 +1879,12 @@ impl<'a> core::fmt::Display for DiagnosticName<'a> {
     fn fmt(&self, f: &mut core::fmt::Formatter) -> core::fmt::Result {
         repr::each! {
             &self.0.repr,
-            UTC => write!(f, "UTC"),
-            UNKNOWN => write!(f, "Etc/Unknown"),
-            FIXED(offset) => write!(f, "{offset}"),
-            STATIC_TZIF(tzif) => write!(f, "{}", tzif.name().unwrap_or("Local")),
-            ARC_TZIF(tzif) => write!(f, "{}", tzif.name().unwrap_or("Local")),
-            ARC_POSIX(posix) => write!(f, "{posix}"),
+            UTC => f.write_str("UTC"),
+            UNKNOWN => f.write_str("Etc/Unknown"),
+            FIXED(offset) => offset.fmt(f),
+            STATIC_TZIF(tzif) => f.write_str(tzif.name().unwrap_or("Local")),
+            ARC_TZIF(tzif) => f.write_str(tzif.name().unwrap_or("Local")),
+            ARC_POSIX(posix) => posix.fmt(f),
         }
     }
 }
@@ -1938,13 +1931,14 @@ impl<'t> TimeZoneAbbreviation<'t> {
 ///
 /// This module exists to _encapsulate_ the representation rigorously and
 /// expose a safe and sound API.
+// To squash warnings on older versions of Rust. Our polyfill below should
+// match what std does on newer versions of Rust, so the confusability should
+// be fine. ---AG
+#[allow(unstable_name_collisions)]
 mod repr {
     use core::mem::ManuallyDrop;
 
-    use crate::{
-        tz::tzif::TzifStatic,
-        util::{constant::unwrap, t},
-    };
+    use crate::{tz::tzif::TzifStatic, util::constant::unwrap};
     #[cfg(feature = "alloc")]
     use crate::{
         tz::{posix::PosixTimeZoneOwned, tzif::TzifOwned},
@@ -2070,7 +2064,7 @@ mod repr {
         /// Creates a representation for a fixed offset time zone.
         #[inline]
         pub(super) const fn fixed(offset: Offset) -> Repr {
-            let seconds = offset.seconds_ranged().get_unchecked();
+            let seconds = offset.seconds();
             // OK because offset is in -93599..=93599.
             let shifted = unwrap!(
                 seconds.checked_shl(4),
@@ -2098,7 +2092,7 @@ mod repr {
             // Thankfully, this is the only variant that is a pointer that
             // we want to create in a const context. So we just make this
             // variant's tag `0`, and thus, no explicit pointer tagging is
-            // required. (Becuase we ensure the alignment is at least 4, and
+            // required. (Because we ensure the alignment is at least 4, and
             // thus the least significant 3 bits are 0.)
             //
             // If this ends up not working out or if we need to support
@@ -2142,10 +2136,9 @@ mod repr {
         pub(super) unsafe fn get_fixed(&self) -> Offset {
             #[allow(unstable_name_collisions)]
             let addr = self.ptr.addr();
-            // NOTE: Because of sign extension, we need to case to `i32`
+            // NOTE: Because of sign extension, we need to cast to `i32`
             // before shifting.
-            let seconds = t::SpanZoneOffset::new_unchecked((addr as i32) >> 4);
-            Offset::from_seconds_ranged(seconds)
+            Offset::from_seconds_unchecked((addr as i32) >> 4)
         }
 
         /// Returns true if and only if this representation corresponds to the
@@ -2259,7 +2252,7 @@ mod repr {
         }
     }
 
-    // SAFETY: We use automic reference counting.
+    // SAFETY: We use automatic reference counting.
     unsafe impl Send for Repr {}
     // SAFETY: We don't use an interior mutability and otherwise don't permit
     // any kind of mutation (other than for an `Arc` managing its ref counts)
@@ -2270,9 +2263,9 @@ mod repr {
         fn fmt(&self, f: &mut core::fmt::Formatter) -> core::fmt::Result {
             each! {
                 self,
-                UTC => write!(f, "UTC"),
-                UNKNOWN => write!(f, "Etc/Unknown"),
-                FIXED(offset) => write!(f, "{offset:?}"),
+                UTC => f.write_str("UTC"),
+                UNKNOWN => f.write_str("Etc/Unknown"),
+                FIXED(offset) => core::fmt::Debug::fmt(&offset, f),
                 STATIC_TZIF(tzif) => {
                     // The full debug output is a bit much, so constrain it.
                     let field = tzif.name().unwrap_or("Local");
@@ -2283,7 +2276,11 @@ mod repr {
                     let field = tzif.name().unwrap_or("Local");
                     f.debug_tuple("TZif").field(&field).finish()
                 },
-                ARC_POSIX(posix) => write!(f, "Posix({posix})"),
+                ARC_POSIX(posix) => {
+                    f.write_str("Posix(")?;
+                    core::fmt::Display::fmt(&posix, f)?;
+                    f.write_str(")")
+                },
             }
         }
     }
@@ -2420,11 +2417,6 @@ mod repr {
     /// The strict provenance APIs in `core` were stabilized in Rust 1.84,
     /// but it will likely be a while before Jiff can use them. (At time of
     /// writing, 2025-02-24, Jiff's MSRV is Rust 1.70.)
-    ///
-    /// The `const` requirement is also why these are non-generic free
-    /// functions and not defined via an extension trait. It's also why we
-    /// don't have the useful `map_addr` routine (which is directly relevant to
-    /// our pointer tagging use case).
     mod polyfill {
         pub(super) const fn without_provenance(addr: usize) -> *const u8 {
             // SAFETY: Every valid `usize` is also a valid pointer (but not
@@ -2433,7 +2425,10 @@ mod repr {
             // MSRV(1.84): We *really* ought to be using
             // `core::ptr::without_provenance` here, but Jiff's MSRV prevents
             // us.
-            unsafe { core::mem::transmute(addr) }
+            #[allow(integer_to_ptr_transmutes)]
+            unsafe {
+                core::mem::transmute(addr)
+            }
         }
 
         // On Rust 1.84+, `StrictProvenancePolyfill` isn't actually used.
@@ -3865,5 +3860,45 @@ mod tests {
         // being found here, despite the fact that it existed and was found
         // by `preceding`.
         assert_eq!(transitions, last4);
+    }
+
+    #[cfg(feature = "alloc")]
+    #[test]
+    fn regression_tzif_parse_panic() {
+        _ = TimeZone::tzif(
+            "",
+            &[
+                84, 90, 105, 102, 6, 0, 5, 35, 84, 10, 77, 0, 0, 0, 84, 82,
+                105, 102, 0, 128, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+                0, 0, 0, 0, 2, 0, 0, 0, 5, 0, 0, 82, 28, 77, 0, 0, 90, 105,
+                78, 0, 0, 0, 0, 0, 0, 0, 84, 90, 105, 102, 0, 0, 5, 0, 84, 90,
+                105, 84, 77, 10, 0, 0, 0, 15, 93, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+                0, 0, 0, 0, 0, 0, 0, 2, 0, 0, 0, 5, 0, 0, 0, 82, 0, 64, 1, 0,
+                0, 2, 0, 0, 0, 0, 0, 0, 126, 1, 0, 0, 4, 0, 0, 0, 0, 0, 0, 0,
+                0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 126, 0, 0, 0, 0, 0,
+                0, 160, 109, 1, 0, 90, 105, 102, 0, 0, 5, 0, 87, 90, 105, 84,
+                77, 10, 0, 0, 0, 0, 0, 122, 102, 105, 0, 0, 0, 0, 0, 0, 0, 0,
+                2, 0, 0, 0, 0, 0, 0, 5, 82, 0, 0, 0, 0, 0, 2, 0, 0, 90, 105,
+                102, 0, 0, 5, 0, 84, 90, 105, 84, 77, 10, 0, 0, 0, 102, 0, 0,
+                0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 84, 90, 195, 190, 10, 84,
+                90, 77, 49, 84, 90, 105, 102, 49, 44, 74, 51, 44, 50, 10,
+            ],
+        );
+    }
+
+    /// A regression test where a TZ lookup for the minimum civil datetime
+    /// resulted in a panic in the TZif handling.
+    #[cfg(feature = "alloc")]
+    #[test]
+    fn regression_tz_lookup_datetime_min() {
+        use alloc::string::ToString;
+
+        let test_file = TzifTestFile::get("America/Boa_Vista");
+        let tz = TimeZone::tzif(test_file.name, test_file.data).unwrap();
+        let err = tz.to_timestamp(DateTime::MIN).unwrap_err();
+        assert_eq!(
+            err.to_string(),
+            "converting datetime with time zone offset `-04:02:40` to timestamp overflowed: parameter 'Unix timestamp seconds' is not in the required range of -377705023201..=253402207200",
+        );
     }
 }

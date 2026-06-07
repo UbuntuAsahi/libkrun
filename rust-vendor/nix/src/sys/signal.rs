@@ -753,7 +753,7 @@ impl<'a> IntoIterator for &'a SigSet {
 }
 
 /// A signal handler.
-#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+#[derive(Clone, Copy, Debug, Hash)]
 pub enum SigHandler {
     /// Default signal handling.
     SigDfl,
@@ -929,7 +929,7 @@ pub unsafe fn sigaction(signal: Signal, sigaction: &SigAction) -> Result<SigActi
 ///
 /// # Errors
 ///
-/// Returns [`Error(Errno::EOPNOTSUPP)`] if `handler` is
+/// Returns [`Error(Errno::EOPNOTSUPP)`](Errno::EOPNOTSUPP) if `handler` is
 /// [`SigAction`][SigActionStruct]. Use [`sigaction`][SigActionFn] instead.
 ///
 /// `signal` also returns any error from `libc::signal`, such as when an attempt
@@ -1035,7 +1035,7 @@ pub fn sigprocmask(how: SigmaskHow, set: Option<&SigSet>, oldset: Option<&mut Si
 ///   - If less than `-1`, the signal is sent to all processes whose
 ///     process group ID is equal to the absolute value of `pid`.
 /// * `signal` - Signal to send. If `None`, error checking is performed
-///              but no signal is actually sent.
+///   but no signal is actually sent.
 ///
 /// See Also
 /// [`kill(2)`](https://pubs.opengroup.org/onlinepubs/9699919799/functions/kill.html)

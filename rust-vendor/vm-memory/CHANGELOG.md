@@ -1,10 +1,51 @@
 # Changelog
 
-## Upcoming version
+## \[v0.17.1\]
 
-## \[v0.16.2\]
+No visible changes.
 
-- \[[#328](https://github.com/rust-vmm/vm-memory/pull/328)\] Bump vmm-sys-util crate to version 0.14.0
+## \[v0.17.0\]
+
+### Added
+
+- \[[#311](https://github.com/rust-vmm/vm-memory/pull/311)\] Allow compiling without the ReadVolatile and WriteVolatile implementations
+- \[[#312](https://github.com/rust-vmm/vm-memory/pull/312)\] `GuestRegionContainer`, a generic container of `GuestMemoryRegion`s, generalizing `GuestMemoryMmap` (which 
+  is now a type alias for `GuestRegionContainer<GuestRegionMmap>`).
+- \[[#338](https://github.com/rust-vmm/vm-memory/pull/338)\] Make `GuestMemoryAtomic` always implement `Clone`.
+- \[[#338](https://github.com/rust-vmm/vm-memory/pull/338)\] Make `GuestAddressSpace` a subtrait of `Clone`.
+- \[[#339](https://github.com/rust-vmm/vm-memory/pull/339)\] Add `GuestMemory::get_slices()`
+
+### Changed
+
+- \[[#307](https://github.com/rust-vmm/vm-memory/pull/304)\] Move `read_volatile_from`, `read_exact_volatile_from`,
+  `write_volatile_to` and `write_all_volatile_to` functions from the `GuestMemory` trait to the `Bytes` trait.
+- \[[#312](https://github.com/rust-vmm/vm-memory/pull/312)\]: Give `GuestMemory::find_region` and `GuestMemory::num_regions`
+  a default implementation, based on linear search.
+- \[[#312](https://github.com/rust-vmm/vm-memory/pull/312)\]: Provide a marker trait, `GuestMemoryRegionBytes`, which enables a default implementation of `Bytes<MemoryRegionAddress>`
+  for a `GuestMemoryRegion` if implemented.
+- \[[#312](https://github.com/rust-vmm/vm-memory/pull/312)\]: Adjust error types returned from `GuestMemoryMmap::from_ranges[_with_files]`
+  and `GuestRegionMmap::from_range` to be separate from the error type returned by `GuestRegionCollection` functions.
+  Change return type of `GuestRegionMmap::new` from `Result` to `Option`.
+- \[#324](https:////github.com/rust-vmm/vm-memory/pull/324)\] `GuestMemoryRegion::bitmap()` now returns a `BitmapSlice`. Accessing the full bitmap is now possible only if the type of the memory region is know, for example with `MmapRegion::bitmap()`.
+- \[[#339](https://github.com/rust-vmm/vm-memory/pull/339)\] Implement `Bytes::load()` and `Bytes::store()` with `get_slices()` instead of `to_region_addr()`
+
+### Removed
+
+- \[[#307](https://github.com/rust-vmm/vm-memory/pull/304)\] Remove deprecated functions `Bytes::read_from`, `Bytes::read_exact_from`,
+  `Bytes::write_to`, `Bytes::write_all_to`, `GuestMemory::as_slice`, `GuestMemory::as_slice_mut`, `GuestMemory::with_regions`, 
+  `GuestMemory::with_regions_mut`, `GuestMemory::map_and_fold`, `VolatileSlice::as_ptr`, `VolatileRef::as_ptr`, and
+  `VolatileArrayRef::as_ptr`.
+- \[[#320](https://github.com/rust-vmm/vm-memory/pull/320)\] Drop `check_file_offset` check when using  `MmapRegionBuilder`.
+  The `mmap(2)` syscall itself already validates that offset and length are valid, and trying to replicate this check
+  in userspace ended up being imperfect.
+
+### Fixed
+
+- \[[#339](https://github.com/rust-vmm/vm-memory/pull/339)\] Fix `Bytes::read()` and `Bytes::write()` not to ignore `try_access()`'s `count` parameter
+
+### Deprecated
+
+- \[[#349](https://github.com/rust-vmm/vm-memory/pull/349)\] Deprecate `GuestMemory::try_access()`. Use `GuestMemory::get_slices()` instead.
 
 ## \[v0.16.1\]
 

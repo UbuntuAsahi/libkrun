@@ -58,7 +58,7 @@ dependencies = [
 
 [[package]]
 name = "nitro-enclaves"
-version = "0.6.0"
+version = "0.6.1"
 dependencies = [
  "bitflags 2.9.1",
  "libc",

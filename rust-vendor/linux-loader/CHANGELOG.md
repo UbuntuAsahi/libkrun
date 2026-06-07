@@ -1,5 +1,21 @@
 # Upcoming Release
 
+# [v0.13.2]
+
+## Changed
+
+- [[#214](https://github.com/rust-vmm/linux-loader/pull/214)] Updated vm-memory to 0.17.1.
+
+# [v0.13.1]
+
+## Changed
+- [[#148](https://github.com/rust-vmm/linux-loader/pull/148)] Fixing kernel commandline parameter validation
+  This change allows parameter values containing spaces in the middle, provided they are enclosed in quotes. However, 
+  strings with quotes in the middle will no longer be accepted as valid parameter values.
+- [[#205](https://github.com/rust-vmm/linux-loader/pull/205)] Make image header for ARM and RISC-V public
+  Kernel headers for ARM and RISC-V are made public to be used in a fw_cfg
+  implementation that reads the kernel header.
+
 # [v0.13.0]
 
 ## Added

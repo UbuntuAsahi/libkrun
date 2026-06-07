@@ -56,7 +56,12 @@ impl ClockId {
         self.0
     }
 
-    #[cfg(any(linux_android, target_os = "emscripten", target_os = "fuchsia"))]
+    #[cfg(any(
+        linux_android,
+        target_os = "emscripten",
+        target_os = "freebsd",
+        target_os = "fuchsia"
+    ))]
     /// Starts at zero when the kernel boots and increments monotonically in SI seconds while the
     /// machine is running.
     pub const CLOCK_BOOTTIME: ClockId = ClockId(libc::CLOCK_BOOTTIME);
@@ -68,7 +73,12 @@ impl ClockId {
     /// Increments in SI seconds.
     pub const CLOCK_MONOTONIC: ClockId = ClockId(libc::CLOCK_MONOTONIC);
     /// Like [`CLOCK_MONOTONIC`](ClockId::CLOCK_MONOTONIC), but optimized for execution time at the expense of accuracy.
-    #[cfg(any(linux_android, target_os = "emscripten", target_os = "fuchsia"))]
+    #[cfg(any(
+        linux_android,
+        target_os = "emscripten",
+        target_os = "freebsd",
+        target_os = "fuchsia"
+    ))]
     pub const CLOCK_MONOTONIC_COARSE: ClockId =
         ClockId(libc::CLOCK_MONOTONIC_COARSE);
     #[cfg(freebsdlike)]
@@ -104,7 +114,12 @@ impl ClockId {
     pub const CLOCK_REALTIME_ALARM: ClockId =
         ClockId(libc::CLOCK_REALTIME_ALARM);
     /// Like [`CLOCK_REALTIME`](ClockId::CLOCK_REALTIME), but optimized for execution time at the expense of accuracy.
-    #[cfg(any(linux_android, target_os = "emscripten", target_os = "fuchsia"))]
+    #[cfg(any(
+        linux_android,
+        target_os = "emscripten",
+        target_os = "freebsd",
+        target_os = "fuchsia"
+    ))]
     pub const CLOCK_REALTIME_COARSE: ClockId =
         ClockId(libc::CLOCK_REALTIME_COARSE);
     #[cfg(freebsdlike)]
