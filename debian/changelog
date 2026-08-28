@@ -1,3 +1,10 @@
+libkrun (1.18.1-1asahi1.24.04) noble; urgency=medium
+
+  * Build for noble
+  * Based on tag v1.18.1
+
+ -- Andreas Schröder <andreas@kernelpanik.net>  Mon, 8 Jun 2026 01:06:00 +0200
+
 libkrun (1.18.1-1asahi1.26.04) resolute; urgency=medium
 
   * Build for resolute
