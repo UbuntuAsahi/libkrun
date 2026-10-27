@@ -1,0 +1,40 @@
+From: Tobias Heider <me@tobhe.de>
+Date: Sun, 22 Dec 2024 15:30:01 +0100
+Subject: Make cargo binary path configurable
+
+---
+ Makefile | 6 +++---
+ 1 file changed, 3 insertions(+), 3 deletions(-)
+
+--- a/Makefile
++++ b/Makefile
+@@ -207,7 +207,7 @@
+ 
+ 
+ $(LIBRARY_RELEASE_$(OS)): $(SYSROOT_TARGET) $(INIT_BINARY_BSD)
+-	cargo build --release $(FEATURE_FLAGS)
++	$(CARGO) build --release $(FEATURE_FLAGS)
+ ifeq ($(SEV),1)
+ 	mv target/release/libkrun.so target/release/$(KRUN_BASE_$(OS))
+ endif
+@@ -226,7 +226,7 @@
+ 	cp target/release/$(KRUN_BASE_$(OS)) $(LIBRARY_RELEASE_$(OS))
+ 
+ $(LIBRARY_DEBUG_$(OS)): $(SYSROOT_TARGET) $(INIT_BINARY_BSD)
+-	cargo build $(FEATURE_FLAGS)
++	$(CARGO) build $(FEATURE_FLAGS)
+ ifeq ($(SEV),1)
+ 	mv target/debug/libkrun.so target/debug/$(KRUN_BASE_$(OS))
+ endif
+@@ -260,9 +260,9 @@
+ ifeq ($(BUILD_BSD_INIT),1)
+ 	rm -f $(INIT_BINARY_BSD)
+ endif
+-	cargo clean
++	$(CARGO) clean
+ 	rm -rf test-prefix
+-	cd tests; cargo clean
++	cd tests; $(CARGO) clean
+ 
+ clean-all: clean clean-sysroot
+ 

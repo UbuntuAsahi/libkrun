@@ -1,0 +1,177 @@
+libkrun (1.19.7-1asahi1.26.04) resolute; urgency=medium
+
+  * Build for resolute
+  * Based on tag v1.19.7
+
+ -- Andreas Schröder <andreas@kernelpanik.net>  Tue, 27 Oct 2026 19:14:00 +0100
+
+libkrun (1.19.4-1asahi1.26.04) resolute; urgency=medium
+
+  * Build for resolute
+  * Based on tag v1.19.4
+
+ -- Andreas Schröder <andreas@kernelpanik.net>  Fri, 28 Aug 2026 22:41:00 +0200
+
+libkrun (1.18.1-1asahi1.24.04) noble; urgency=medium
+
+  * Build for noble
+  * Based on tag v1.18.1
+
+ -- Andreas Schröder <andreas@kernelpanik.net>  Mon, 8 Jun 2026 01:06:00 +0200
+
+libkrun (1.18.1-1asahi1.26.04) resolute; urgency=medium
+
+  * Build for resolute
+  * Based on tag v1.18.1
+
+ -- Andreas Schröder <andreas@kernelpanik.net>  Sun, 7 Jun 2026 23:09:00 +0200
+
+libkrun (1.17.4-1asahi1.26.04) resolute; urgency=medium
+
+  * Build for resolute
+  * Based on tag v1.17.4
+
+ -- Andreas Schröder <andreas@kernelpanik.net>  Fri, 3 Apr 2026 22:53:00 +0200
+
+libkrun (1.17.4-1asahi1.25.10) questing; urgency=medium
+
+  * Build for questing
+  * Based on tag v1.17.4
+
+ -- Andreas Schröder <andreas@kernelpanik.net>  Fri, 3 Apr 2026 22:35:00 +0200
+
+libkrun (1.17.4-1asahi2.24.04) noble; urgency=medium
+
+  * Build for noble
+  * Based on tag v1.17.4
+
+ -- Andreas Schröder <andreas@kernelpanik.net>  Fri, 3 Apr 2026 18:38:00 +0200
+
+libkrun (1.17.2-1asahi1.25.10) questing; urgency=medium
+
+  * Build for questing
+  * Based on tag v1.17.2
+
+ -- Andreas Schröder <andreas@kernelpanik.net>  Sun, 8 Feb 2026 08:49:00 +0100
+
+libkrun (1.17.2-1asahi1.24.04) noble; urgency=medium
+
+  * Build for noble
+  * Based on tag v1.17.2
+
+ -- Andreas Schröder <andreas@kernelpanik.net>  Sat, 7 Feb 2026 23:22:00 +0100
+
+libkrun (1.15.1-1asahi1.25.10) questing; urgency=medium
+
+  * Build for questing
+  * Based on tag v1.15.1
+
+ -- Andreas Schröder <andreas@kernelpanik.net>  Tue, 16 Sep 2025 23:13:00 +0200
+
+libkrun (1.15.1-1asahi1.25.04) plucky; urgency=medium
+
+  * Build for plucky
+  * Based on tag v1.15.1
+
+ -- Andreas Schröder <andreas@kernelpanik.net>  Mon, 15 Sep 2025 21:20:00 +0200
+
+libkrun (1.15.1-1asahi1.24.04) noble; urgency=medium
+
+  * Build for noble
+  * Based on tag v1.15.1
+
+ -- Andreas Schröder <andreas@kernelpanik.net>  Sun, 7 Sep 2025 22:02:00 +0200
+
+libkrun (1.14.0-1asahi4.25.04) plucky; urgency=medium
+
+  * Build for plucky
+  * Based on tag v1.14.0
+
+ -- Andreas Schröder <andreas@kernelpanik.net>  Wed, 6 Aug 2025 22:22:00 +0200
+
+libkrun (1.14.0-1asahi7.24.04) noble; urgency=medium
+
+  * Build for noble
+  * Based on tag v1.14.0
+
+ -- Andreas Schröder <andreas@kernelpanik.net>  Tue, 5 Aug 2025 13:15:00 +0200
+
+libkrun (1.12.2-1asahi1.24.04) noble; urgency=medium
+
+  * Build for noble
+  * Based on tag v1.12.2
+
+ -- Andreas Schröder <andreas@kernelpanik.net>  Sun, 1 May 2025 23:35:00 +0200
+
+libkrun (1.11.2-1asahi5.25.04) plucky; urgency=medium
+
+  * Build for plucky
+  * Based on tag v1.11.2
+
+ -- Andreas Schröder <andreas@kernelpanik.net>  Tue, 6 May 2025 07:16:00 +0200
+
+libkrun (1.11.2-1asahi4.24.04) noble; urgency=medium
+
+  * Build for noble
+  * Based on tag v1.11.2
+
+ -- Andreas Schröder <andreas@kernelpanik.net>  Sat, 3 May 2025 23:12:00 +0200
+
+libkrun (1.10.1.1-1asahi1.24.10) oracular; urgency=medium
+
+  * Build for oracular
+  * Based on tag v1.10.1
+
+ -- Andreas Schröder <andreas@kernelpanik.net>  Sun, 30 Mar 2025 22:40:00 +0200
+
+libkrun (1.10.1.1-1asahi2.24.04) noble; urgency=medium
+
+  * Build for noble
+  * Based on tag v1.10.1
+
+ -- Andreas Schröder <andreas@kernelpanik.net>  Sun, 30 Mar 2025 18:48:00 +0200
+
+libkrun (1.9.8-1asahi25.24.10) oracular; urgency=medium
+
+  * Change library directory from /usr/lib64 to /usr/lib
+  * Build for oracular
+
+ -- Andreas Schröder <andreas@kernelpanik.net>  Wed, 4 Dec 2024 01:04:00 +0100
+
+libkrun (1.9.8-1asahi24.24.10) oracular; urgency=medium
+
+  * Change library directory from /usr/lib64 to /usr/lib
+  * Build for oracular
+
+ -- Andreas Schröder <andreas@kernelpanik.net>  Tue, 3 Dec 2024 08:08:00 +0100
+
+libkrun (1.9.8-1asahi22.24.04) noble; urgency=medium
+
+  * Change library directory from /usr/lib64 to /usr/lib
+  * Build for noble
+
+ -- Andreas Schröder <andreas@kernelpanik.net>  Sun, 1 Dec 2024 23:39:00 +0100
+
+libkrun (1.9.8-1asahi19.24.04) oracular; urgency=medium
+
+  * vendor all Rust dependencies
+  * build in offline mode
+  * restrict to arm64
+  * build for oracular
+
+ -- Andreas Schröder <andreas@kernelpanik.net>  Sun, 1 Dec 2024 21:23:00 +0100
+
+libkrun (1.9.8-1asahi18.24.04) noble; urgency=medium
+
+  * vendor all Rust dependencies
+  * build in offline mode
+  * restrict to arm64
+
+ -- Andreas Schröder <andreas@kernelpanik.net>  Sun, 1 Dec 2024 21:07:00 +0100
+
+libkrun (1.9.8-1asahi1.24.04) noble; urgency=medium
+
+  * Build for noble
+  * Based on tag v1.9.8
+
+ -- Andreas Schröder <andreas@kernelpanik.net>  Sat, 30 Nov 2024 21:38:00 +0100

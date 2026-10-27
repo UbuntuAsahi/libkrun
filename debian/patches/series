@@ -1,0 +1,6 @@
+0001-Make-cargo-binary-path-configurable.patch
+0002-Exclude-rust-vendor-from-workspace.patch
+0003_disable_tests
+0004_fix_release_path
+0006-rutabaga_gfx_virgl_renderer_resource_map_fixed.patch
+0008-remove-libkrun.pc
